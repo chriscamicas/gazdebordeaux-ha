@@ -1,0 +1,15 @@
+{
+  "domain": "gazdebordeaux",
+  "name": "Gaz de Bordeaux",
+  "documentation": "",
+  "version": "1.0.0",
+  "issue_tracker": "",
+  "config_flow": true,
+  "requirements": [
+  ],
+  "dependencies": [],
+  "codeowners": [
+    "@chriscamicas"
+  ],
+  "iot_class": "cloud_polling"
+}
