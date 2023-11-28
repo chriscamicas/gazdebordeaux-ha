@@ -7,7 +7,7 @@
   "config_flow": true,
   "requirements": [
   ],
-  "dependencies": [],
+  "dependencies": ["recorder"],
   "codeowners": [
     "@chriscamicas"
   ],
