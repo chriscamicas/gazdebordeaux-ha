@@ -8,5 +8,18 @@
                 }
             }
         }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Config. existante",
+                "description": "Modifiez éventuellement la configuration",
+                "data": {
+                    "username": "[%key:common::config_flow::data::username%]",
+                    "password": "[%key:common::config_flow::data::password%]",
+                    "reset_stats": "Efface tout l'historique de statistiques"
+                }
+            }
+        }
     }
 }

@@ -54,7 +54,7 @@ class Gazdebordeaux:
     # ------------------------------------------------------
     async def async_get_total_usage(self):
         monthly_data = await self.async_get_data(None, None, "year")
-        Logger.debug("Data retreived %s", monthly_data)
+        # Logger.debug("Data retreived %s", monthly_data)
 
         paris_tz = pytz.timezone('Europe/Paris')
         d = monthly_data["total"]
@@ -66,7 +66,7 @@ class Gazdebordeaux:
     
     async def async_get_daily_usage(self, start: datetime|None, end: datetime|None) -> List[DailyUsageRead]:
         daily_data = await self.async_get_data(start, end, "month")
-        Logger.debug("Data retreived %s", daily_data)
+        # Logger.debug("Data retreived %s", daily_data)
 
         usageReads: List[DailyUsageRead] = []
 
@@ -84,7 +84,7 @@ class Gazdebordeaux:
 
             ))
         
-        Logger.debug("Data transformed: %s", usageReads)
+        # Logger.debug("Data transformed: %s", usageReads)
         return usageReads
 
 

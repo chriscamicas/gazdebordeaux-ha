@@ -6,11 +6,13 @@ from dataclasses import dataclass
 
 from .gazdebordeaux import TotalUsageRead
 
-from homeassistant.components.sensor import (
+from homeassistant.components.sensor.const import (
     SensorDeviceClass,
+    SensorStateClass
+)
+from homeassistant.components.sensor import (
     SensorEntity,
-    SensorEntityDescription,
-    SensorStateClass,
+    SensorEntityDescription
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy, UnitOfVolume

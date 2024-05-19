@@ -7,14 +7,14 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigEntry, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
 from .const import DOMAIN
 from .gazdebordeaux import Gazdebordeaux
+from .option_flow import GazdebordeauxOptionFlow
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,19 +43,19 @@ async def _validate_login(
     return errors
 
 
-class GazdebordeauxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class GazdebordeauxConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Gazdebordeaux."""
 
     VERSION = 1
 
     def __init__(self) -> None:
         """Initialize a new GazdebordeauxConfigFlow."""
-        self.reauth_entry: config_entries.ConfigEntry | None = None
+        self.reauth_entry: ConfigEntry | None = None
         self.utility_info: dict[str, Any] | None = None
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
         errors: dict[str, str] = {}
         if user_input is not None:
@@ -70,9 +70,15 @@ class GazdebordeauxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
     @callback
-    def _async_create_gazdebordeaux_entry(self, data: dict[str, Any]) -> FlowResult:
+    def _async_create_gazdebordeaux_entry(self, data: dict[str, Any]) -> ConfigFlowResult:
         """Create the config entry."""
         return self.async_create_entry(
             title=f"({data[CONF_USERNAME]})",
             data=data,
         )
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry):
+        """Get options flow for this handler"""
+        return GazdebordeauxOptionFlow(config_entry)
