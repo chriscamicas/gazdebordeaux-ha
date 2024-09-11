@@ -12,6 +12,7 @@ ME_URL = "https://life.gazdebordeaux.fr/api/users/me"
 
 INPUT_DATE_FORMAT = "%Y-%m-%d"
 
+paris_tz = pytz.timezone('Europe/Paris')
 Logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------------------------------------------------
@@ -56,7 +57,6 @@ class Gazdebordeaux:
         monthly_data = await self.async_get_data(None, None, "year")
         # Logger.debug("Data retreived %s", monthly_data)
 
-        paris_tz = pytz.timezone('Europe/Paris')
         d = monthly_data["total"]
         return TotalUsageRead(
                 amountOfEnergy = d["amountOfEnergy"],
@@ -70,7 +70,6 @@ class Gazdebordeaux:
 
         usageReads: List[DailyUsageRead] = []
 
-        paris_tz = pytz.timezone('Europe/Paris')
         for d in daily_data:
             if d == "total":
                 continue
