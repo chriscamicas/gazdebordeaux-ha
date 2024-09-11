@@ -68,7 +68,6 @@ GAS_SENSORS: tuple[GdbEntityDescription, ...] = (
         name="Current bill gas cost to date",
         device_class=SensorDeviceClass.MONETARY,
         native_unit_of_measurement="€",
-        suggested_unit_of_measurement="€",
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=0,
         value_fn=lambda data: data.price,
