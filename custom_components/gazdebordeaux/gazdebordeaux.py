@@ -6,9 +6,9 @@ from aiohttp import ClientSession
 from json.decoder import JSONDecodeError
 from typing import List, Any
 
-DATA_URL = "https://life.gazdebordeaux.fr/api{0}/consumptions"
-LOGIN_URL = "https://life.gazdebordeaux.fr/api/login_check"
-ME_URL = "https://life.gazdebordeaux.fr/api/users/me"
+DATA_URL = "https://lifeapi.gazdebordeaux.fr{0}/consumptions"
+LOGIN_URL = "https://lifeapi.gazdebordeaux.fr/login_check"
+ME_URL = "https://lifeapi.gazdebordeaux.fr/users/me"
 
 INPUT_DATE_FORMAT = "%Y-%m-%d"
 
@@ -59,7 +59,7 @@ class Gazdebordeaux:
 
         d = monthly_data["total"]
         return TotalUsageRead(
-                amountOfEnergy = d["amountOfEnergy"],
+                amountOfEnergy = d["kwh"],
                 volumeOfEnergy = d["volumeOfEnergy"],
                 price = d["price"],
             )
@@ -75,7 +75,7 @@ class Gazdebordeaux:
                 continue
             usageReads.append(DailyUsageRead(
                 date = datetime.strptime(d, INPUT_DATE_FORMAT).replace(tzinfo=paris_tz),
-                amountOfEnergy = daily_data[d]["amountOfEnergy"],
+                amountOfEnergy = daily_data[d]["kwh"],
                 volumeOfEnergy = daily_data[d]["volumeOfEnergy"],
                 price = daily_data[d]["price"],
                 ratio = daily_data[d]["ratio"],
