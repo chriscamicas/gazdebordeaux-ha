@@ -2,3 +2,4 @@
 
 DOMAIN = "gazdebordeaux"
 RESET_STATISTICS = "reset_stats"
+HOUSE = "house"

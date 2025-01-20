@@ -96,6 +96,9 @@ class Gazdebordeaux:
 
             if self._selectedHouse is None:
                 await self.loadHouse()
+                Logger.debug("Loading last selected house")
+
+            Logger.debug("Loaded house info: %s", self._selectedHouse)
 
             headers = {
                 "Authorization": "Bearer " + self._token,

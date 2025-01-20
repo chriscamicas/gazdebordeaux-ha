@@ -4,7 +4,7 @@ import logging
 from types import MappingProxyType
 from typing import Any, cast
 
-from .const import RESET_STATISTICS
+from .const import RESET_STATISTICS, HOUSE
 from .gazdebordeaux import Gazdebordeaux, DailyUsageRead, TotalUsageRead
 
 from homeassistant.components.recorder.util import get_instance
@@ -43,24 +43,38 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             # Refresh every 12h to be at most 12h behind.
             update_interval=timedelta(hours=12),
         )
+
+        house: Any = None
+        if HOUSE in entry_data:
+            house = entry_data[HOUSE]
+
         self.api = Gazdebordeaux(
             aiohttp_client.async_get_clientsession(hass),
             entry_data[CONF_USERNAME],
             entry_data[CONF_PASSWORD],
+            None,
+            house
         )
         self.reset = False
         if RESET_STATISTICS in entry_data:
-            _LOGGER.debug("Asked to reset all statistics...")
             self.reset = bool(entry_data[RESET_STATISTICS])
-            entries=self.hass.config_entries.async_entries(DOMAIN)
-            _LOGGER.debug("Updating config...")
-            self.hass.config_entries.async_update_entry(
-                entries[0], data={
-                    CONF_USERNAME: entry_data[CONF_USERNAME],
-                    CONF_PASSWORD: entry_data[CONF_PASSWORD],
-                    RESET_STATISTICS: False
-                }
-            )
+            if self.reset:
+                _LOGGER.debug("Asked to reset all statistics...")
+                entries=self.hass.config_entries.async_entries(DOMAIN)
+
+                house: Any = None
+                if HOUSE in entry_data:
+                    house = entry_data[HOUSE]
+
+                _LOGGER.debug("Updating config...")
+                self.hass.config_entries.async_update_entry(
+                    entries[0], data={
+                        CONF_USERNAME: entry_data[CONF_USERNAME],
+                        CONF_PASSWORD: entry_data[CONF_PASSWORD],
+                        RESET_STATISTICS: False,
+                        HOUSE: house,
+                    }
+                )
 
         @callback
         def _dummy_listener() -> None:
