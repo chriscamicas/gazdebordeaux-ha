@@ -14,7 +14,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.components.sensor.const import DOMAIN as SENSOR_DOMAIN
 
-from .const import DOMAIN, RESET_STATISTICS
+from .const import DOMAIN, RESET_STATISTICS, HOUSE
 from .gazdebordeaux import Gazdebordeaux
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,11 +55,16 @@ class GazdebordeauxOptionFlow(OptionsFlow):
         if RESET_STATISTICS in self.config_entry.data:
             reset_stats = self.config_entry.data[RESET_STATISTICS]
 
+        house: Any = ""
+        if HOUSE in self.config_entry.data:
+            house = self.config_entry.data[HOUSE]
+
         option_form = vol.Schema(
             {
                 vol.Required(CONF_USERNAME, default=self.config_entry.data[CONF_USERNAME]): str,
                 vol.Required(CONF_PASSWORD, default=self.config_entry.data[CONF_PASSWORD]): str,
                 vol.Optional(RESET_STATISTICS, default=reset_stats): bool,
+                vol.Optional(HOUSE, default=house): str,
             }
         )
 
