@@ -6,6 +6,11 @@
                     "username": "[%key:common::config_flow::data::username%]",
                     "password": "[%key:common::config_flow::data::password%]"
                 }
+            },
+            "house": {
+                "data": {
+                    "house": "Contrat"
+                }
             }
         }
     },
@@ -17,7 +22,8 @@
                 "data": {
                     "username": "[%key:common::config_flow::data::username%]",
                     "password": "[%key:common::config_flow::data::password%]",
-                    "reset_stats": "Efface tout l'historique de statistiques"
+                    "reset_stats": "Efface tout l'historique de statistiques",
+                    "house": "Id du contrat '/house/xxxxxxx'"
                 }
             }
         }

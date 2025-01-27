@@ -1,6 +1,6 @@
 import logging
 import dataclasses
-from datetime import datetime
+from datetime import datetime, time
 import pytz
 from aiohttp import ClientSession
 from json.decoder import JSONDecodeError
@@ -9,6 +9,8 @@ from typing import List, Any
 DATA_URL = "https://lifeapi.gazdebordeaux.fr{0}/consumptions"
 LOGIN_URL = "https://lifeapi.gazdebordeaux.fr/login_check"
 ME_URL = "https://lifeapi.gazdebordeaux.fr/users/me"
+HOUSE_URL = "https://lifeapi.gazdebordeaux.fr${0}"
+HOUSES_URL = "https://lifeapi.gazdebordeaux.fr/addresses"
 
 INPUT_DATE_FORMAT = "%Y-%m-%d"
 
@@ -30,6 +32,22 @@ class DailyUsageRead:
     price: float
     ratio: float
     temperature: float
+
+@dataclasses.dataclass
+class OffPeakTime:
+    startTime: time
+    endTime: time
+
+@dataclasses.dataclass
+class House:
+    id: str
+    remoteAddressId: str
+    address: str
+    selected: bool
+    contractCategory: str # "gas" or "electricity"
+    contractCode: str
+    priceCategory: str
+    offPeakTimes: None|List[OffPeakTime]
 # ------------------------------------------------------------------------------------------------------------
 class Gazdebordeaux:
     def __init__(self, session: ClientSession, username: str, password: str, token=None, house=None):
@@ -124,13 +142,13 @@ class Gazdebordeaux:
             Logger.error("An unexpected error occured while loading the data", exc_info=True)
             raise
 
-    async def loadHouse(self):
+    async def async_get_houses(self):
         if self._token is None:
             await self.async_login()
         if self._token is None:
             return
         
-        Logger.debug("Loading house info...")
+        Logger.debug("Loading houses info...")
         
         headers = {
             "Authorization": "Bearer " + self._token,
@@ -139,12 +157,50 @@ class Gazdebordeaux:
         }
 
         # querying House id
-        async with self._session.get(ME_URL, headers=headers) as response:
+        async with self._session.get(HOUSES_URL, headers=headers) as response:
             try:
                 data = await response.json()
-                self._selectedHouse = data["selectedHouse"]
-                Logger.debug("Loaded house info: %s", data)
+                houses_data = data["hydra:member"]
+                
+                houses: List[House] = []
+
+                for d in range(len(houses_data)):
+                    offPeakTimeData = houses_data[d]["offPeakTimes"]
+                    offPeakTimes = None
+                    if offPeakTimeData is not None and len(offPeakTimeData) > 0:
+                        offPeakTimes = list(map(lambda x: OffPeakTime(
+                            startTime=time(hour=int(x[0].split(":")[0]), minute=int(x[0].split(":")[1])),
+                            endTime=time(hour=int(x[0].split(":")[0]), minute=int(x[0].split(":")[1])),
+                        ), offPeakTimeData))
+
+                    houses.append(House(
+                        id= houses_data[d]["@id"],
+                        remoteAddressId= houses_data[d]["remoteAddressId"],
+                        address= houses_data[d]["addressStreet"],
+                        selected= houses_data[d]["selected"],
+                        contractCategory= houses_data[d]["contractType"]["category"],
+                        contractCode= houses_data[d]["contractType"]["code"],
+                        priceCategory= houses_data[d]["priceCategory"],
+                        offPeakTimes=offPeakTimes
+                    ))
+                
+                Logger.debug("Data transformed: %s", houses)
+                return houses
 
             except JSONDecodeError:
-                Logger.error("An unexpected error occured while loading the house", exc_info=True)
+                Logger.error("An unexpected error occured while loading the houses list", exc_info=True)
                 raise
+
+    async def loadHouse(self):
+        houses = await self.async_get_houses()
+
+        if houses is None or len(houses) == 0:
+            raise
+        
+        selectedHouse = next(house for house in houses if house.selected)
+
+        if selectedHouse is None:
+            raise
+
+        self._selectedHouse = selectedHouse.id
+        return selectedHouse

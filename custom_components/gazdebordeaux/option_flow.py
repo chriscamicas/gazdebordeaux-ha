@@ -19,23 +19,6 @@ from .gazdebordeaux import Gazdebordeaux
 
 _LOGGER = logging.getLogger(__name__)
 
-async def _validate_login(
-    hass: HomeAssistant, login_data: dict[str, str]
-) -> dict[str, str]:
-    """Validate login data and return any errors."""
-    api = Gazdebordeaux(
-        async_create_clientsession(hass),
-        login_data[CONF_USERNAME],
-        login_data[CONF_PASSWORD],
-    )
-    errors: dict[str, str] = {}
-    try:
-        await api.async_login()
-    except Exception:
-        errors["base"] = "invalid_auth"
-    return errors
-
-
 class GazdebordeauxOptionFlow(OptionsFlow):
     """Handle a config flow for Gazdebordeaux."""
 
