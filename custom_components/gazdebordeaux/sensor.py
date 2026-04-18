@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 
 from .gazdebordeaux import TotalUsageRead
 
@@ -21,6 +22,7 @@ from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .coordinator import GdbCoordinator
@@ -81,8 +83,7 @@ async def async_setup_entry(
     """Set up the Gdb sensor."""
 
     coordinator: GdbCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities: list[GdbSensor] = []
-    totalUsage = coordinator.data 
+    entities: list[GdbSensor | GdbLastUpdateSensor] = []
 
     device_id = f"gazpar"
     device = DeviceInfo(
@@ -103,6 +104,11 @@ async def async_setup_entry(
                 device_id,
             )
         )
+
+    # Ajout du sensor de dernière actualisation
+    entities.append(
+        GdbLastUpdateSensor(coordinator, device, device_id)
+    )
 
     async_add_entities(entities)
 
@@ -135,3 +141,31 @@ class GdbSensor(CoordinatorEntity[GdbCoordinator], SensorEntity):
                 self.coordinator.data
             )
         return None
+
+
+# Nouveau sensor de dernière actualisation
+class GdbLastUpdateSensor(CoordinatorEntity[GdbCoordinator], SensorEntity):
+    """Sensor affichant la date de dernière actualisation."""
+
+    _attr_name = "Gaz de Bordeaux Last Update"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:clock-check"
+
+    def __init__(
+        self,
+        coordinator: GdbCoordinator,
+        device: DeviceInfo,
+        device_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{device_id}_last_update"
+        self._attr_device_info = device
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Return the last update datetime."""
+        if self.coordinator.last_update is None:
+            return None
+        # HA exige un datetime avec timezone pour SensorDeviceClass.TIMESTAMP
+        return dt_util.as_local(self.coordinator.last_update)

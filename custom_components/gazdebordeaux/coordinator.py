@@ -7,15 +7,30 @@ from typing import Any, cast
 from .const import RESET_STATISTICS, HOUSE
 from .gazdebordeaux import Gazdebordeaux, DailyUsageRead, TotalUsageRead
 
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMetaData,
+    StatisticMeanType
+)
 from homeassistant.components.recorder.util import get_instance
-from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
     statistics_during_period
 )
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntries, ConfigEntry
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, UnitOfEnergy, UnitOfVolume
+# from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, UnitOfEnergy, UnitOfVolume, UnitOfCurrency
+from homeassistant.const import (
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    UnitOfEnergy,
+    UnitOfVolume,
+    CURRENCY_EURO
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import aiohttp_client
@@ -43,6 +58,9 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             # Refresh every 12h to be at most 12h behind.
             update_interval=timedelta(hours=12),
         )
+
+        # Initialisation de la date de dernière actualisation
+        self.last_update: datetime | None = None
 
         house: Any = None
         if HOUSE in entry_data:
@@ -104,8 +122,11 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         # we need to insert data into statistics.
         await self._insert_statistics()
 
-        return totalUsage
+        # Mise à jour de la date de dernière actualisation
+        self.last_update = datetime.now()
+        _LOGGER.debug("Last update: %s", self.last_update.strftime("%Y-%m-%d %H:%M:%S"))
 
+        return totalUsage
 
     async def _insert_statistics(self) -> None:
         """Insert gdb statistics."""
@@ -151,7 +172,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
                 {cost_statistic_id, consumption_statistic_id, volume_statistic_id},
                 "day",
                 None,
-                {"sate", "sum"},
+                {"state", "sum"},
             )
             # s:StatisticsRow =stats[cost_statistic_id][0]
             
@@ -203,29 +224,43 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
                 "Gaz de Bordeaux",
             )
         )
+        
         cost_metadata = StatisticMetaData(
             has_mean=False,
+            mean_type=StatisticMeanType.NONE,
+            # unit_class="monetary",
+            unit_class=None,
             has_sum=True,
             name=f"{name_prefix} cost",
             source=DOMAIN,
             statistic_id=cost_statistic_id,
-            unit_of_measurement=None,
+            unit_of_measurement=CURRENCY_EURO,
+            device_class=SensorDeviceClass.MONETARY,
+            state_class=SensorStateClass.TOTAL
         )
         consumption_metadata = StatisticMetaData(
             has_mean=False,
+            mean_type=StatisticMeanType.NONE,
+            unit_class="energy",
             has_sum=True,
             name=f"{name_prefix} consumption",
             source=DOMAIN,
             statistic_id=consumption_statistic_id,
-            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR
+            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=SensorStateClass.TOTAL
         )
         volume_metadata = StatisticMetaData(
             has_mean=False,
+            mean_type=StatisticMeanType.NONE,
+            unit_class="volume",
             has_sum=True,
             name=f"{name_prefix} volume",
             source=DOMAIN,
             statistic_id=volume_statistic_id,
-            unit_of_measurement=UnitOfVolume.CUBIC_METERS
+            unit_of_measurement=UnitOfVolume.CUBIC_METERS,
+            device_class=SensorDeviceClass.GAS,
+            state_class=SensorStateClass.TOTAL
         )
 
         async_add_external_statistics(self.hass, cost_metadata, cost_statistics)

@@ -1,18 +1,15 @@
-"""Config flow for Gazdebordeaux integration."""
+"""Options flow for Gazdebordeaux integration."""
 from __future__ import annotations
 
-from collections.abc import Mapping
 import logging
 from typing import Any
 
 import voluptuous as vol
 
 from homeassistant.config_entries import OptionsFlow, ConfigEntry, ConfigFlowResult
-from homeassistant.helpers import selector
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
-from homeassistant.components.sensor.const import DOMAIN as SENSOR_DOMAIN
 
 from .const import DOMAIN, RESET_STATISTICS, HOUSE
 from .gazdebordeaux import Gazdebordeaux
@@ -37,34 +34,39 @@ async def _validate_login(
 
 
 class GazdebordeauxOptionFlow(OptionsFlow):
-    """Handle a config flow for Gazdebordeaux."""
+    """Handle an options flow for Gazdebordeaux."""
 
     VERSION = 1
-    _user_inputs: dict = {}
 
     def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize options flow."""
-        self.config_entry = config_entry
+        # Ne PAS faire self.config_entry = config_entry
+        # HA le gère en interne via la classe parente
+        self._user_inputs: dict = {}  # Attribut d'instance
 
-    async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
-        """Gestion de l'étape 'init'. Point d'entrée de notre
-        optionsFlow. Comme pour le ConfigFlow, cette méthode est appelée 2 fois
-        """
-
-        reset_stats: Any = False
-        if RESET_STATISTICS in self.config_entry.data:
-            reset_stats = self.config_entry.data[RESET_STATISTICS]
-
-        house: Any = ""
-        if HOUSE in self.config_entry.data:
-            house = self.config_entry.data[HOUSE]
+    async def async_step_init(
+        self, user_input: dict | None = None
+    ) -> ConfigFlowResult:
+        """Gestion de l'étape 'init'."""
 
         option_form = vol.Schema(
             {
-                vol.Required(CONF_USERNAME, default=self.config_entry.data[CONF_USERNAME]): str,
-                vol.Required(CONF_PASSWORD, default=self.config_entry.data[CONF_PASSWORD]): str,
-                vol.Optional(RESET_STATISTICS, default=reset_stats): bool,
-                vol.Optional(HOUSE, default=house): str,
+                vol.Required(
+                    CONF_USERNAME,
+                    default=self.config_entry.data.get(CONF_USERNAME, ""),
+                ): str,
+                vol.Required(
+                    CONF_PASSWORD,
+                    default=self.config_entry.data.get(CONF_PASSWORD, ""),
+                ): str,
+                vol.Optional(
+                    RESET_STATISTICS,
+                    default=self.config_entry.data.get(RESET_STATISTICS, False),
+                ): bool,
+                vol.Optional(
+                    HOUSE,
+                    default=self.config_entry.data.get(HOUSE, ""),
+                ): str,
             }
         )
 
@@ -77,7 +79,7 @@ class GazdebordeauxOptionFlow(OptionsFlow):
 
         # 2ème appel : il y a des user_input -> on stocke le résultat
         _LOGGER.debug(
-            "option_flow step user (2). On a reçu les valeurs: %s", user_input
+            "option_flow step user (2). Valeurs reçues: %s", user_input
         )
         # On mémorise les user_input
         self._user_inputs.update(user_input)
@@ -85,10 +87,10 @@ class GazdebordeauxOptionFlow(OptionsFlow):
         # On appelle le step de fin pour enregistrer les modifications
         return await self.async_end()
 
-    async def async_end(self):
-        """Finalization of the ConfigEntry creation"""
+    async def async_end(self) -> ConfigFlowResult:
+        """Finalisation et sauvegarde des modifications."""
         _LOGGER.info(
-            "Recreation de l'entry %s. La nouvelle config est maintenant : %s",
+            "Recreation de l'entry %s. Nouvelle config : %s",
             self.config_entry.entry_id,
             self._user_inputs,
         )
@@ -97,5 +99,5 @@ class GazdebordeauxOptionFlow(OptionsFlow):
         self.hass.config_entries.async_update_entry(
             self.config_entry, data=self._user_inputs
         )
-        # On ne fait rien dans l'objet options dans la configEntry
-        return self.async_create_entry(title=None, data=None)
+
+        return self.async_create_entry(title="", data={})
