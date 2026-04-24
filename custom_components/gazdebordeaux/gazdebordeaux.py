@@ -76,7 +76,15 @@ class Gazdebordeaux:
     # ------------------------------------------------------
     async def async_get_total_usage(self):
         monthly_data = await self.async_get_data(None, None, "year")
-        # Logger.debug("Data retreived %s", monthly_data)
+        Logger.debug("Total usage raw response: %s", monthly_data)
+
+        if monthly_data is None:
+            raise Exception("Total usage response was None (likely login/auth failure)")
+        if not isinstance(monthly_data, dict):
+            raise Exception("Unexpected total usage response type=%s value=%r" % (type(monthly_data).__name__, monthly_data))
+        if "total" not in monthly_data:
+            Logger.error("Total usage response missing 'total' key. Keys: %s. Full response: %s", list(monthly_data.keys()), monthly_data)
+            raise Exception("Total usage response missing 'total' key. Keys present: %s" % list(monthly_data.keys()))
 
         d = monthly_data["total"]
         return TotalUsageRead(
@@ -84,10 +92,15 @@ class Gazdebordeaux:
                 volumeOfEnergy = d["volumeOfEnergy"],
                 price = d["price"],
             )
-    
+
     async def async_get_daily_usage(self, start: datetime|None, end: datetime|None) -> List[DailyUsageRead]:
         daily_data = await self.async_get_data(start, end, "month")
-        # Logger.debug("Data retreived %s", daily_data)
+        Logger.debug("Daily usage raw response: %s", daily_data)
+
+        if daily_data is None:
+            raise Exception("Daily usage response was None (likely login/auth failure)")
+        if not isinstance(daily_data, dict):
+            raise Exception("Unexpected daily usage response type=%s value=%r" % (type(daily_data).__name__, daily_data))
 
         usageReads: List[DailyUsageRead] = []
 
@@ -139,8 +152,15 @@ class Gazdebordeaux:
             if end is not None:
                 params["endDate"] = end.strftime("%Y-%m-%d")
 
-            async with self._session.get(DATA_URL.format(self._selectedHouse), headers=headers, json=payload, params=params) as response:
-                return await response.json()
+            url = DATA_URL.format(self._selectedHouse)
+            Logger.debug("Fetching data url=%s params=%s", url, params)
+            async with self._session.get(url, headers=headers, json=payload, params=params) as response:
+                body = await response.text()
+                Logger.debug("Data response status=%s content-type=%s body=%s", response.status, response.headers.get("Content-Type"), body)
+                try:
+                    return await response.json(content_type=None)
+                except JSONDecodeError:
+                    raise Exception("Data response was not JSON (status=%s, content-type=%s): %s" % (response.status, response.headers.get("Content-Type"), body))
 
         except Exception:
             Logger.error("An unexpected error occured while loading the data", exc_info=True)
