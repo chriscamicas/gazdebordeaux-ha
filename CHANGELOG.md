@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.6] - 2026-04-24
+- Migrate to new `life.gazdebordeaux.fr/api` endpoints (old `lifeapi` subdomain now returns 403)
+- Send same-origin browser headers so login and data requests are accepted
+- Log the login response body on failure to aid debugging
+
 ## [1.1.2] - 2024-09-11
 - Fix Error adding entity
 
