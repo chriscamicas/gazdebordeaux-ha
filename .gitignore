@@ -134,3 +134,6 @@ dmypy.json
 .LSOverride
 .Spotlight-V100
 .Trashes
+
+.claude
+.devcontainer

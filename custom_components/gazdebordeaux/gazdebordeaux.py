@@ -6,11 +6,27 @@ from aiohttp import ClientSession
 from json.decoder import JSONDecodeError
 from typing import List, Any
 
-DATA_URL = "https://lifeapi.gazdebordeaux.fr{0}/consumptions"
-LOGIN_URL = "https://lifeapi.gazdebordeaux.fr/login_check"
-ME_URL = "https://lifeapi.gazdebordeaux.fr/users/me"
+DATA_URL = "https://life.gazdebordeaux.fr/api{0}/consumptions"
+LOGIN_URL = "https://life.gazdebordeaux.fr/api/login_check"
+ME_URL = "https://life.gazdebordeaux.fr/api/users/me"
 
 INPUT_DATE_FORMAT = "%Y-%m-%d"
+
+# Browser-like headers. The WAF on life.gazdebordeaux.fr rejects requests that
+# don't look like the SPA (same-origin fetch from the web app).
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Origin": "https://life.gazdebordeaux.fr",
+    "Referer": "https://life.gazdebordeaux.fr/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+}
 
 paris_tz = pytz.timezone('Europe/Paris')
 Logger = logging.getLogger(__name__)
@@ -41,14 +57,19 @@ class Gazdebordeaux:
 
     async def async_login(self):
         Logger.debug("Loging in...")
-        async with self._session.post(LOGIN_URL, json={
+        async with self._session.post(LOGIN_URL, headers=BROWSER_HEADERS, json={
             "email":self._username,
             "password":self._password
         }) as response:
-            token = await response.json()
+            body = await response.text()
+            Logger.debug("Login response status=%s content-type=%s body=%s", response.status, response.headers.get("Content-Type"), body)
+            try:
+                token = await response.json(content_type=None)
+            except JSONDecodeError:
+                raise Exception("Login response was not JSON (status=%s, content-type=%s): %s" % (response.status, response.headers.get("Content-Type"), body))
 
             if token["token"] is None:
-                raise Exception("invalid auth" + await response.text())
+                raise Exception("invalid auth" + body)
             Logger.debug("Login response OK")
             self._token = token["token"]
 
@@ -101,9 +122,10 @@ class Gazdebordeaux:
             Logger.debug("Loaded house info: %s", self._selectedHouse)
 
             headers = {
+                **BROWSER_HEADERS,
                 "Authorization": "Bearer " + self._token,
                 "Connection": "keep-alive",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             }
             payload = {
                 "email":self._username,
@@ -133,9 +155,10 @@ class Gazdebordeaux:
         Logger.debug("Loading house info...")
         
         headers = {
+            **BROWSER_HEADERS,
             "Authorization": "Bearer " + self._token,
             "Connection": "keep-alive",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
 
         # querying House id
