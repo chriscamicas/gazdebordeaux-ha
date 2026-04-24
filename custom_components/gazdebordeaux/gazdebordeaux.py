@@ -6,7 +6,7 @@ from aiohttp import ClientSession
 from json.decoder import JSONDecodeError
 from typing import List, Any
 
-DATA_URL = "https://life.gazdebordeaux.fr/api{0}/consumptions"
+DATA_URL = "https://life.gazdebordeaux.fr{0}/consumptions"
 LOGIN_URL = "https://life.gazdebordeaux.fr/api/login_check"
 ME_URL = "https://life.gazdebordeaux.fr/api/users/me"
 
