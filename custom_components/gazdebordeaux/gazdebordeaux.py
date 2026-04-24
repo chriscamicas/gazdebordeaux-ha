@@ -152,7 +152,15 @@ class Gazdebordeaux:
             if end is not None:
                 params["endDate"] = end.strftime("%Y-%m-%d")
 
-            url = DATA_URL.format(self._selectedHouse)
+            # selectedHouse can be "/houses/{uuid}" or "/api/houses/{uuid}" depending
+            # on the account; normalize to always include the /api prefix exactly once.
+            house = self._selectedHouse or ""
+            if not house.startswith("/api/"):
+                if not house.startswith("/"):
+                    house = "/" + house
+                house = "/api" + house
+
+            url = DATA_URL.format(house)
             Logger.debug("Fetching data url=%s params=%s", url, params)
             async with self._session.get(url, headers=headers, json=payload, params=params) as response:
                 body = await response.text()
