@@ -65,7 +65,7 @@ class GazdebordeauxOptionFlow(OptionsFlow):
                 ): bool,
                 vol.Optional(
                     HOUSE,
-                    default=self.config_entry.data.get(HOUSE, ""),
+                    description={"suggested_value": self.config_entry.data.get(HOUSE, "")},
                 ): str,
             }
         )
