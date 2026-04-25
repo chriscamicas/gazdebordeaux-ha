@@ -179,23 +179,52 @@ class Gazdebordeaux:
             await self.async_login()
         if self._token is None:
             return
-        
+
         Logger.debug("Loading house info...")
-        
-        headers = {
+
+        # querying House id
+        async with self._session.get(ME_URL, headers=self._authenticated_headers()) as response:
+            try:
+                data = await response.json()
+                Logger.debug("Loaded house info: %s", data)
+            except JSONDecodeError:
+                Logger.error("An unexpected error occured while loading the house", exc_info=True)
+                raise
+
+        if data.get("selectedHouse"):
+            self._selectedHouse = data["selectedHouse"]
+            return
+
+        # Multi-contract accounts (e.g. gas + electricity) come back with no
+        # selectedHouse. Iterate the houses list and pick the first gas one.
+        houses = data.get("houses") or []
+        if not houses:
+            raise Exception("No houses found on this account")
+
+        Logger.debug("No selectedHouse; iterating over %d houses to find a gas contract", len(houses))
+        seen: list[tuple[str, str | None]] = []
+        for path in houses:
+            house = await self._fetch_house(path)
+            category = (house.get("contractType") or {}).get("category")
+            seen.append((path, category))
+            Logger.debug("House %s category=%s", path, category)
+            if category == "gas":
+                Logger.debug("Selected gas house %s", path)
+                self._selectedHouse = path
+                return
+
+        raise Exception("No gas contract found among %d houses: %s" % (len(houses), seen))
+
+    def _authenticated_headers(self) -> dict:
+        return {
             **BROWSER_HEADERS,
-            "Authorization": "Bearer " + self._token,
+            "Authorization": "Bearer " + (self._token or ""),
             "Connection": "keep-alive",
             "Content-Type": "application/json",
         }
 
-        # querying House id
-        async with self._session.get(ME_URL, headers=headers) as response:
-            try:
-                data = await response.json()
-                self._selectedHouse = data["selectedHouse"]
-                Logger.debug("Loaded house info: %s", data)
-
-            except JSONDecodeError:
-                Logger.error("An unexpected error occured while loading the house", exc_info=True)
-                raise
+    async def _fetch_house(self, path: str) -> Any:
+        url = "https://life.gazdebordeaux.fr" + path
+        Logger.debug("Fetching house %s", url)
+        async with self._session.get(url, headers=self._authenticated_headers()) as response:
+            return await response.json(content_type=None)
