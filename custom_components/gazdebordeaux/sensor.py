@@ -1,20 +1,15 @@
-"""Support for Opower sensors."""
+"""Sensors for Gaz de Bordeaux integration."""
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Optional
 
-from .gazdebordeaux import TotalUsageRead
+from .gazdebordeaux import TotalUsageRead, HouseData, MonthlyRead
 
-from homeassistant.components.sensor.const import (
-    SensorDeviceClass,
-    SensorStateClass
-)
-from homeassistant.components.sensor import (
-    SensorEntity,
-    SensorEntityDescription
-)
+from homeassistant.components.sensor.const import SensorDeviceClass, SensorStateClass
+from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import HomeAssistant
@@ -29,50 +24,108 @@ from .coordinator import GdbCoordinator
 
 
 @dataclass
-class GdbEntityDescriptionMixin:
-    """Mixin values for required keys."""
-
-    value_fn: Callable[[TotalUsageRead], str | float]
+class GdbSensorMixin:
+    value_fn: Callable[[dict[str, HouseData]], Optional[float]]
 
 
 @dataclass
-class GdbEntityDescription(SensorEntityDescription, GdbEntityDescriptionMixin):
-    """Class describing Gaz de Bordeaux sensors entities."""
+class GdbSensorDescription(SensorEntityDescription, GdbSensorMixin):
+    pass
 
 
-# suggested_display_precision=0 for all sensors since
-# Opower provides 0 decimal points for all these.
-# (for the statistics in the energy dashboard Opower does provide decimal points)
+def _gas(data: dict[str, HouseData]) -> Optional[HouseData]:
+    return data.get("gas")
 
-GAS_SENSORS: tuple[GdbEntityDescription, ...] = (
-    GdbEntityDescription(
+def _elec(data: dict[str, HouseData]) -> Optional[HouseData]:
+    return data.get("elec")
+
+
+# --- Gas sensors (backward compat, same keys as before) ---
+GAS_PERIOD_SENSORS: tuple[GdbSensorDescription, ...] = (
+    GdbSensorDescription(
         key="gas_usage_to_date",
         name="Current bill gas usage to date",
         device_class=SensorDeviceClass.GAS,
         native_unit_of_measurement=UnitOfVolume.CUBIC_METERS,
-        suggested_unit_of_measurement=UnitOfVolume.CUBIC_METERS,
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=0,
-        value_fn=lambda data: data.volumeOfEnergy,
+        value_fn=lambda d: _gas(d).total.volumeOfEnergy if _gas(d) else None,
     ),
-    GdbEntityDescription(
+    GdbSensorDescription(
         key="gas_energy_to_date",
         name="Current energy usage to date",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=0,
-        value_fn=lambda data: data.amountOfEnergy,
+        value_fn=lambda d: _gas(d).total.amountOfEnergy if _gas(d) else None,
     ),
-    GdbEntityDescription(
+    GdbSensorDescription(
         key="gas_cost_to_date",
         name="Current bill gas cost to date",
         device_class=SensorDeviceClass.MONETARY,
         native_unit_of_measurement="€",
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=0,
-        value_fn=lambda data: data.price,
+        value_fn=lambda d: _gas(d).total.price if _gas(d) else None,
+    ),
+)
+
+# --- Elec sensors (new) ---
+ELEC_PERIOD_SENSORS: tuple[GdbSensorDescription, ...] = (
+    GdbSensorDescription(
+        key="elec_usage_to_date",
+        name="Current elec usage to date",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL,
+        suggested_display_precision=0,
+        value_fn=lambda d: _elec(d).total.amountOfEnergy if _elec(d) else None,
+    ),
+    GdbSensorDescription(
+        key="elec_cost_to_date",
+        name="Current elec cost to date",
+        device_class=SensorDeviceClass.MONETARY,
+        native_unit_of_measurement="€",
+        state_class=SensorStateClass.TOTAL,
+        suggested_display_precision=0,
+        value_fn=lambda d: _elec(d).total.price if _elec(d) else None,
+    ),
+)
+
+# --- Monthly sensors (new) ---
+MONTHLY_SENSORS: tuple[GdbSensorDescription, ...] = (
+    GdbSensorDescription(
+        key="gas_current_month_cost",
+        name="GdB gas current month cost",
+        device_class=SensorDeviceClass.MONETARY,
+        native_unit_of_measurement="€",
+        suggested_display_precision=2,
+        value_fn=lambda d: _gas(d).current_month.price if _gas(d) and _gas(d).current_month else None,
+    ),
+    GdbSensorDescription(
+        key="gas_previous_month_cost",
+        name="GdB gas previous month cost",
+        device_class=SensorDeviceClass.MONETARY,
+        native_unit_of_measurement="€",
+        suggested_display_precision=2,
+        value_fn=lambda d: _gas(d).previous_month.price if _gas(d) and _gas(d).previous_month else None,
+    ),
+    GdbSensorDescription(
+        key="elec_current_month_cost",
+        name="GdB elec current month cost",
+        device_class=SensorDeviceClass.MONETARY,
+        native_unit_of_measurement="€",
+        suggested_display_precision=2,
+        value_fn=lambda d: _elec(d).current_month.price if _elec(d) and _elec(d).current_month else None,
+    ),
+    GdbSensorDescription(
+        key="elec_previous_month_cost",
+        name="GdB elec previous month cost",
+        device_class=SensorDeviceClass.MONETARY,
+        native_unit_of_measurement="€",
+        suggested_display_precision=2,
+        value_fn=lambda d: _elec(d).previous_month.price if _elec(d) and _elec(d).previous_month else None,
     ),
 )
 
@@ -80,92 +133,72 @@ GAS_SENSORS: tuple[GdbEntityDescription, ...] = (
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
-    """Set up the Gdb sensor."""
-
     coordinator: GdbCoordinator = hass.data[DOMAIN][entry.entry_id]
     entities: list[GdbSensor | GdbLastUpdateSensor] = []
 
-    device_id = f"gazpar"
+    device_id = "gazpar"
     device = DeviceInfo(
         identifiers={(DOMAIN, device_id)},
-        name=f"Gaz de Bordeaux",
+        name="Gaz de Bordeaux",
         manufacturer="Regaz",
         model="gazpar",
         entry_type=DeviceEntryType.SERVICE,
     )
-    sensors: tuple[GdbEntityDescription, ...] = GAS_SENSORS
-    for sensor in sensors:
-        entities.append(
-            GdbSensor(
-                coordinator,
-                sensor,
-                "",
-                device,
-                device_id,
-            )
-        )
 
-    # Ajout du sensor de dernière actualisation
-    entities.append(
-        GdbLastUpdateSensor(coordinator, device, device_id)
-    )
+    # Always create gas period sensors (backward compat)
+    for desc in GAS_PERIOD_SENSORS:
+        entities.append(GdbSensor(coordinator, desc, device, device_id))
 
+    # Create elec + monthly sensors if multi-house is configured
+    houses = entry.options.get("houses", [])
+    has_elec = any(h.get("type") == "elec" for h in houses)
+    has_gas = any(h.get("type") == "gas" for h in houses)
+
+    if has_elec:
+        for desc in ELEC_PERIOD_SENSORS:
+            entities.append(GdbSensor(coordinator, desc, device, device_id))
+
+    if houses:
+        for desc in MONTHLY_SENSORS:
+            # Only create sensors for house types that are configured
+            if desc.key.startswith("gas_") and not has_gas:
+                continue
+            if desc.key.startswith("elec_") and not has_elec:
+                continue
+            entities.append(GdbSensor(coordinator, desc, device, device_id))
+
+    entities.append(GdbLastUpdateSensor(coordinator, device, device_id))
     async_add_entities(entities)
 
 
 class GdbSensor(CoordinatorEntity[GdbCoordinator], SensorEntity):
-    """Representation of an Gdb sensor."""
+    entity_description: GdbSensorDescription
 
-    entity_description: GdbEntityDescription
-
-    def __init__(
-        self,
-        coordinator: GdbCoordinator,
-        description: GdbEntityDescription,
-        utility_account_id: str,
-        device: DeviceInfo,
-        device_id: str,
-    ) -> None:
-        """Initialize the sensor."""
+    def __init__(self, coordinator, description, device, device_id):
         super().__init__(coordinator)
         self.entity_description = description
         self._attr_unique_id = f"{device_id}_{description.key}"
         self._attr_device_info = device
-        self.utility_account_id = utility_account_id
 
     @property
     def native_value(self) -> StateType:
-        """Return the state."""
         if self.coordinator.data is not None:
-            return self.entity_description.value_fn(
-                self.coordinator.data
-            )
+            return self.entity_description.value_fn(self.coordinator.data)
         return None
 
 
-# Nouveau sensor de dernière actualisation
 class GdbLastUpdateSensor(CoordinatorEntity[GdbCoordinator], SensorEntity):
-    """Sensor affichant la date de dernière actualisation."""
-
     _attr_name = "Gaz de Bordeaux Last Update"
     _attr_device_class = SensorDeviceClass.TIMESTAMP
     _attr_icon = "mdi:clock-check"
 
-    def __init__(
-        self,
-        coordinator: GdbCoordinator,
-        device: DeviceInfo,
-        device_id: str,
-    ) -> None:
-        """Initialize the sensor."""
+    def __init__(self, coordinator, device, device_id):
         super().__init__(coordinator)
         self._attr_unique_id = f"{device_id}_last_update"
         self._attr_device_info = device
 
     @property
     def native_value(self) -> datetime | None:
-        """Return the last update datetime."""
         if self.coordinator.last_update is None:
             return None
-        # HA exige un datetime avec timezone pour SensorDeviceClass.TIMESTAMP
         return dt_util.as_local(self.coordinator.last_update)
