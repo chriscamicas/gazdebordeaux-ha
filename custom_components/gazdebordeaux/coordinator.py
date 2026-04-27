@@ -4,8 +4,8 @@ import logging
 from types import MappingProxyType
 from typing import Any, cast
 
-from .const import RESET_STATISTICS, HOUSE
-from .gazdebordeaux import Gazdebordeaux, DailyUsageRead, TotalUsageRead
+from .const import RESET_STATISTICS, HOUSE, HOUSES
+from .gazdebordeaux import Gazdebordeaux, DailyUsageRead, TotalUsageRead, HouseData
 
 from homeassistant.components.recorder.models import (
     StatisticData,
@@ -41,13 +41,14 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 
-class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
+class GdbCoordinator(DataUpdateCoordinator[dict[str, HouseData]]):
     """Handle fetching GazdeBordeaux data, updating sensors and inserting statistics."""
 
     def __init__(
         self,
         hass: HomeAssistant,
         entry_data: MappingProxyType[str, Any],
+        entry_options: MappingProxyType[str, Any] | None = None,
     ) -> None:
         """Initialize the data handler."""
         super().__init__(
@@ -104,29 +105,49 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         # _async_update_data not periodically getting called which is needed for _insert_statistics.
         self.async_add_listener(_dummy_listener)
 
+        # Houses to query (from options, or fallback to selectedHouse)
+        self._configured_houses: list[dict] = []
+        if entry_options and HOUSES in entry_options:
+            self._configured_houses = entry_options[HOUSES]
+
     async def _async_update_data(
         self,
-    ) -> TotalUsageRead:
-        """Fetch data from API endpoint."""
+    ) -> dict[str, HouseData]:
+        """Fetch data from all configured houses."""
         try:
-            # Login expires after a few minutes.
-            # Given the infrequent updating (every 12h)
-            # assume previous session has expired and re-login.
             await self.api.async_login()
         except Exception as err:
             raise ConfigEntryAuthFailed from err
 
-        totalUsage: TotalUsageRead = await self.api.async_get_total_usage()
+        houses_data: dict[str, HouseData] = {}
 
-        # Because Opower provides historical usage/cost with a delay of a couple of days
-        # we need to insert data into statistics.
-        await self._insert_statistics()
+        if self._configured_houses:
+            for h in self._configured_houses:
+                try:
+                    data = await self.api.async_get_house_data(h["path"])
+                    houses_data[data.house_type] = data
+                except Exception:
+                    _LOGGER.error("Error fetching house %s", h["path"], exc_info=True)
+        else:
+            # Legacy mode: single house
+            try:
+                totalUsage = await self.api.async_get_total_usage()
+                houses_data["gas"] = HouseData(
+                    house_type="gas", total=totalUsage,
+                    current_month=None, previous_month=None,
+                )
+            except Exception:
+                _LOGGER.error("Error fetching default house", exc_info=True)
+
+        # Statistics import (gas only, backward compat)
+        if "gas" in houses_data:
+            await self._insert_statistics()
 
         # Mise à jour de la date de dernière actualisation
         self.last_update = datetime.now()
         _LOGGER.debug("Last update: %s", self.last_update.strftime("%Y-%m-%d %H:%M:%S"))
 
-        return totalUsage
+        return houses_data
 
     async def _insert_statistics(self) -> None:
         """Insert gdb statistics."""
