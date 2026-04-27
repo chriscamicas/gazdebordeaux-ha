@@ -4,7 +4,7 @@ from datetime import datetime
 import pytz
 from aiohttp import ClientSession
 from json.decoder import JSONDecodeError
-from typing import List, Any
+from typing import List, Any, Optional
 
 DATA_URL = "https://life.gazdebordeaux.fr{0}/consumptions"
 LOGIN_URL = "https://life.gazdebordeaux.fr/api/login_check"
@@ -37,6 +37,22 @@ class TotalUsageRead:
     amountOfEnergy: float
     volumeOfEnergy: float
     price: float
+
+@dataclasses.dataclass
+class MonthlyRead:
+    kwh: float
+    price: float
+    volumeOfEnergy: float
+    contractPrice: float
+    consumptionPrice: float
+
+@dataclasses.dataclass
+class HouseData:
+    """All data for one house."""
+    house_type: str  # "gas" or "elec"
+    total: TotalUsageRead
+    current_month: Optional[MonthlyRead]
+    previous_month: Optional[MonthlyRead]
 
 @dataclasses.dataclass
 class DailyUsageRead:
@@ -228,3 +244,78 @@ class Gazdebordeaux:
         Logger.debug("Fetching house %s", url)
         async with self._session.get(url, headers=self._authenticated_headers()) as response:
             return await response.json(content_type=None)
+
+    # --- Multi-house support ---
+
+    async def async_load_all_houses(self) -> List[str]:
+        """Return all house paths from the user profile."""
+        if self._token is None:
+            await self.async_login()
+        async with self._session.get(ME_URL, headers=self._authenticated_headers()) as response:
+            data = await response.json()
+            return data.get("houses", [])
+
+    async def async_detect_house_type(self, house_path: str) -> str:
+        """Detect if a house is gas or elec by checking volumeOfEnergy."""
+        yearly = await self.async_get_data_for_house(house_path, None, None, "year")
+        total = yearly.get("total", {})
+        return "gas" if total.get("volumeOfEnergy", 0) > 0 else "elec"
+
+    async def async_get_house_data(self, house_path: str) -> HouseData:
+        """Fetch yearly data for a house and return structured data."""
+        yearly = await self.async_get_data_for_house(house_path, None, None, "year")
+        total_raw = yearly["total"]
+        total = TotalUsageRead(
+            amountOfEnergy=total_raw.get("kwh", 0),
+            volumeOfEnergy=total_raw.get("volumeOfEnergy", 0),
+            price=total_raw.get("price", 0),
+        )
+        house_type = "gas" if total.volumeOfEnergy > 0 else "elec"
+        current, previous = self._extract_monthly(yearly)
+        return HouseData(house_type=house_type, total=total,
+                         current_month=current, previous_month=previous)
+
+    async def async_get_data_for_house(self, house_path, start, end, scale) -> Any:
+        """Fetch data for a specific house (not necessarily the selected one)."""
+        if self._token is None:
+            await self.async_login()
+        house = house_path or ""
+        if not house.startswith("/api/"):
+            if not house.startswith("/"):
+                house = "/" + house
+            house = "/api" + house
+        url = DATA_URL.format(house)
+        params = {"scale": scale}
+        if start is not None:
+            params["startDate"] = start.strftime("%Y-%m-%d")
+        if end is not None:
+            params["endDate"] = end.strftime("%Y-%m-%d")
+        async with self._session.get(url, headers=self._authenticated_headers(), params=params) as response:
+            return await response.json(content_type=None)
+
+    def _extract_monthly(self, yearly_data: dict):
+        """Extract current and previous month from yearly API response."""
+        now = datetime.now(paris_tz)
+        current_key = now.strftime("%Y-%m")
+        prev_month = now.month - 1 or 12
+        prev_year = now.year if now.month > 1 else now.year - 1
+        prev_key = f"{prev_year}-{prev_month:02d}"
+        current = None
+        previous = None
+        for key, val in yearly_data.items():
+            if key == "total" or not isinstance(val, dict):
+                continue
+            if key == current_key:
+                current = self._parse_monthly(val)
+            elif key == prev_key:
+                previous = self._parse_monthly(val)
+        return current, previous
+
+    @staticmethod
+    def _parse_monthly(data: dict) -> MonthlyRead:
+        return MonthlyRead(
+            kwh=data.get("kwh", 0), price=data.get("price", 0),
+            volumeOfEnergy=data.get("volumeOfEnergy", 0),
+            contractPrice=data.get("contractPrice", 0),
+            consumptionPrice=data.get("consumptionPrice", 0),
+        )
