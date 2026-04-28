@@ -1,9 +1,9 @@
 """Shared pytest fixtures for the gazdebordeaux integration tests.
 
-Phase 3 will add `pytest_plugins = ["pytest_homeassistant_custom_component"]`
-once HA-fixture-dependent tests are added (config flow, sensor entities).
-For now the test suite is pure-Python so we keep this conftest minimal to
-avoid pulling Home Assistant into the test environment.
+The pure-Python API client tests at this level don't need Home Assistant.
+Tests that *do* need HA fixtures live under `tests/integration/` and pull
+in `pytest_homeassistant_custom_component` via that subdirectory's
+conftest.
 """
 
 from __future__ import annotations
