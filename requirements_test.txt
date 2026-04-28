@@ -3,6 +3,6 @@
 # Pinning them separately tends to fight that resolution.
 pytest-homeassistant-custom-component>=0.13.316
 aioresponses==0.7.*
-ruff==0.7.*
+ruff==0.15.*
 mypy==1.20.*
 types-pytz
