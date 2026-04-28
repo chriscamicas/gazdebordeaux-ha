@@ -1,7 +1,7 @@
 # pytest-homeassistant-custom-component pulls pytest, pytest-asyncio, and
 # pytest-cov, all version-matched to the Home Assistant release it targets.
 # Pinning them separately tends to fight that resolution.
-pytest-homeassistant-custom-component>=0.13.300
+pytest-homeassistant-custom-component>=0.13.316
 aioresponses==0.7.*
 ruff==0.7.*
 mypy==1.13.*
