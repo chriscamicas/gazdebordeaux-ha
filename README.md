@@ -1,5 +1,9 @@
 # Home Assistant Gaz De Bordeaux integration
 
+[![Tests](https://github.com/chriscamicas/gazdebordeaux-ha/actions/workflows/tests.yml/badge.svg)](https://github.com/chriscamicas/gazdebordeaux-ha/actions/workflows/tests.yml)
+[![hassfest](https://github.com/chriscamicas/gazdebordeaux-ha/actions/workflows/hassfest-action.yml/badge.svg)](https://github.com/chriscamicas/gazdebordeaux-ha/actions/workflows/hassfest-action.yml)
+[![HACS validation](https://github.com/chriscamicas/gazdebordeaux-ha/actions/workflows/hacs-action.yml/badge.svg)](https://github.com/chriscamicas/gazdebordeaux-ha/actions/workflows/hacs-action.yml)
+
 ## Installation
 ### Method 1 : HACS (recommended)
 
