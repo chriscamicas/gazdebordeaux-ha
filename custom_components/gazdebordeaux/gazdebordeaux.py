@@ -259,7 +259,7 @@ class Gazdebordeaux:
                 self._selectedHouse = path
                 return
 
-        raise Exception("No gas contract found among %d houses: %s" % (len(houses), seen))
+        raise Exception(f"No gas contract found among {len(houses)} houses: {seen}")
 
     def _authenticated_headers(self) -> dict:
         return {
