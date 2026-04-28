@@ -16,10 +16,6 @@ from homeassistant.components.recorder.statistics import (
     statistics_during_period,
 )
 from homeassistant.components.recorder.util import get_instance
-from homeassistant.components.sensor import (
-    SensorDeviceClass,
-    SensorStateClass,
-)
 from homeassistant.const import (
     CONF_PASSWORD,
     CONF_USERNAME,
@@ -205,20 +201,15 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         name_prefix = " ".join(("Gaz de Bordeaux",))
 
         cost_metadata = StatisticMetaData(
-            has_mean=False,
             mean_type=StatisticMeanType.NONE,
-            # unit_class="monetary",
-            unit_class=None,
+            unit_class="monetary",
             has_sum=True,
             name=f"{name_prefix} cost",
             source=DOMAIN,
             statistic_id=cost_statistic_id,
             unit_of_measurement=CURRENCY_EURO,
-            device_class=SensorDeviceClass.MONETARY,
-            state_class=SensorStateClass.TOTAL,
         )
         consumption_metadata = StatisticMetaData(
-            has_mean=False,
             mean_type=StatisticMeanType.NONE,
             unit_class="energy",
             has_sum=True,
@@ -226,11 +217,8 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             source=DOMAIN,
             statistic_id=consumption_statistic_id,
             unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-            device_class=SensorDeviceClass.ENERGY,
-            state_class=SensorStateClass.TOTAL,
         )
         volume_metadata = StatisticMetaData(
-            has_mean=False,
             mean_type=StatisticMeanType.NONE,
             unit_class="volume",
             has_sum=True,
@@ -238,8 +226,6 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             source=DOMAIN,
             statistic_id=volume_statistic_id,
             unit_of_measurement=UnitOfVolume.CUBIC_METERS,
-            device_class=SensorDeviceClass.GAS,
-            state_class=SensorStateClass.TOTAL,
         )
 
         async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
