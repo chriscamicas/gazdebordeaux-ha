@@ -1,7 +1,9 @@
 pytest==8.*
 pytest-asyncio==0.24.*
 pytest-cov==5.*
-pytest-homeassistant-custom-component==0.13.*
 aioresponses==0.7.*
 ruff==0.7.*
 mypy==1.13.*
+# pytest-homeassistant-custom-component will be added in the phase that
+# introduces HA-fixture-dependent tests; pinning it here would force pytest
+# to load the plugin (and Home Assistant itself) on every run.
