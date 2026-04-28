@@ -1,0 +1,68 @@
+name: Bug report
+description: Report a problem with the integration
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Please fill in as much
+        of the form as you can — vague reports are hard to action.
+
+  - type: input
+    id: integration_version
+    attributes:
+      label: Integration version
+      description: From the manifest, or what HACS shows.
+      placeholder: e.g. 1.1.10
+    validations:
+      required: true
+
+  - type: input
+    id: ha_version
+    attributes:
+      label: Home Assistant version
+      placeholder: e.g. 2026.4.1
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the problem and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        Enable debug logging for this integration first:
+
+        ```yaml
+        logger:
+          logs:
+            custom_components.gazdebordeaux: debug
+        ```
+
+        Then paste the lines around the error. Redact your token, email, and
+        house UUIDs before submitting.
+      render: shell
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Screenshots, account specifics (multiple contracts, recent password change, etc.) — anything that might help.
