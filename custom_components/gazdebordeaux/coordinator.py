@@ -77,10 +77,6 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
                 _LOGGER.debug("Asked to reset all statistics...")
                 entries = self.hass.config_entries.async_entries(DOMAIN)
 
-                house: Any = None
-                if HOUSE in entry_data:
-                    house = entry_data[HOUSE]
-
                 _LOGGER.debug("Updating config...")
                 self.hass.config_entries.async_update_entry(
                     entries[0],
