@@ -1,0 +1,55 @@
+[project]
+name = "gazdebordeaux"
+version = "0.0.0"
+description = "Home Assistant custom integration for Gaz de Bordeaux"
+requires-python = ">=3.13"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = ["env", ".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "F",     # pyflakes
+    "I",     # isort
+    "B",     # flake8-bugbear
+    "UP",    # pyupgrade
+    "SIM",   # flake8-simplify
+    "PL",    # pylint
+    "N",     # pep8-naming
+    "ASYNC", # flake8-async
+    "RUF",   # ruff-specific
+]
+ignore = [
+    "PLR0913", # too-many-arguments — common in HA __init__s
+    "PLR2004", # magic-value-comparison
+    "N802",    # function-name lowercase — HA mixes camelCase in async_step_*
+    "N803",    # argument-name lowercase — same
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Dataclass fields mirror the upstream API's camelCase JSON keys.
+"custom_components/gazdebordeaux/gazdebordeaux.py" = ["N815"]
+# _insert_statistics is large by necessity (recorder API surface).
+"custom_components/gazdebordeaux/coordinator.py" = ["PLR0915"]
+# Tiny helper module; renaming locals here adds no value.
+"custom_components/gazdebordeaux/manifest.py" = ["N806"]
+"tests/**" = ["PLR2004", "S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+files = ["custom_components/gazdebordeaux"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+log_cli_date_format = "%Y-%m-%d %H:%M:%S"

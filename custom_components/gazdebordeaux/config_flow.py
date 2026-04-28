@@ -1,13 +1,12 @@
 """Config flow for Gazdebordeaux integration."""
+
 from __future__ import annotations
 
-from collections.abc import Mapping
 import logging
 from typing import Any
 
 import voluptuous as vol
-
-from homeassistant.config_entries import ConfigFlow, ConfigEntry, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
@@ -26,9 +25,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 )
 
 
-async def _validate_login(
-    hass: HomeAssistant, login_data: dict[str, str]
-) -> dict[str, str]:
+async def _validate_login(hass: HomeAssistant, login_data: dict[str, str]) -> dict[str, str]:
     """Validate login data and return any errors."""
     api = Gazdebordeaux(
         async_create_clientsession(hass),
@@ -53,13 +50,10 @@ class GazdebordeauxConfigFlow(ConfigFlow, domain=DOMAIN):
         self.reauth_entry: ConfigEntry | None = None
         self.utility_info: dict[str, Any] | None = None
 
-    async def async_step_user(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Handle the initial step."""
         errors: dict[str, str] = {}
         if user_input is not None:
-
             errors = await _validate_login(self.hass, user_input)
             if not errors:
                 return self._async_create_gazdebordeaux_entry(user_input)
@@ -67,7 +61,6 @@ class GazdebordeauxConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
         )
-
 
     @callback
     def _async_create_gazdebordeaux_entry(self, data: dict[str, Any]) -> ConfigFlowResult:

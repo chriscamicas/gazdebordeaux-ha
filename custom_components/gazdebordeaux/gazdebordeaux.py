@@ -1,10 +1,11 @@
-import logging
 import dataclasses
+import logging
 from datetime import datetime
+from json.decoder import JSONDecodeError
+from typing import Any
+
 import pytz
 from aiohttp import ClientSession
-from json.decoder import JSONDecodeError
-from typing import List, Any
 
 DATA_URL = "https://life.gazdebordeaux.fr{0}/consumptions"
 LOGIN_URL = "https://life.gazdebordeaux.fr/api/login_check"
@@ -15,7 +16,10 @@ INPUT_DATE_FORMAT = "%Y-%m-%d"
 # Browser-like headers. The WAF on life.gazdebordeaux.fr rejects requests that
 # don't look like the SPA (same-origin fetch from the web app).
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        " (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
     "Accept": "application/json",
     "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
     "Origin": "https://life.gazdebordeaux.fr",
@@ -28,15 +32,17 @@ BROWSER_HEADERS = {
     "Sec-Ch-Ua-Platform": '"macOS"',
 }
 
-paris_tz = pytz.timezone('Europe/Paris')
+paris_tz = pytz.timezone("Europe/Paris")
 Logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
 @dataclasses.dataclass
 class TotalUsageRead:
     amountOfEnergy: float
     volumeOfEnergy: float
     price: float
+
 
 @dataclasses.dataclass
 class DailyUsageRead:
@@ -46,27 +52,46 @@ class DailyUsageRead:
     price: float
     ratio: float
     temperature: float
-# ------------------------------------------------------------------------------------------------------------
+
+
+# ----------------------------------------------------------------------------
 class Gazdebordeaux:
-    def __init__(self, session: ClientSession, username: str, password: str, token=None, house=None):
+    def __init__(
+        self,
+        session: ClientSession,
+        username: str,
+        password: str,
+        token=None,
+        house=None,
+    ):
         self._session = session
         self._username = username
         self._password = password
-        self._token: str|None = token
-        self._selectedHouse: str|None = house
+        self._token: str | None = token
+        self._selectedHouse: str | None = house
 
     async def async_login(self):
         Logger.debug("Loging in...")
-        async with self._session.post(LOGIN_URL, headers=BROWSER_HEADERS, json={
-            "email":self._username,
-            "password":self._password
-        }) as response:
+        async with self._session.post(
+            LOGIN_URL,
+            headers=BROWSER_HEADERS,
+            json={"email": self._username, "password": self._password},
+        ) as response:
             body = await response.text()
-            Logger.debug("Login response status=%s content-type=%s body=%s", response.status, response.headers.get("Content-Type"), body)
+            Logger.debug(
+                "Login response status=%s content-type=%s body=%s",
+                response.status,
+                response.headers.get("Content-Type"),
+                body,
+            )
             try:
                 token = await response.json(content_type=None)
-            except JSONDecodeError:
-                raise Exception("Login response was not JSON (status=%s, content-type=%s): %s" % (response.status, response.headers.get("Content-Type"), body))
+            except JSONDecodeError as err:
+                raise Exception(
+                    f"Login response was not JSON "
+                    f"(status={response.status}, "
+                    f"content-type={response.headers.get('Content-Type')}): {body}"
+                ) from err
 
             if token["token"] is None:
                 raise Exception("invalid auth" + body)
@@ -81,47 +106,59 @@ class Gazdebordeaux:
         if monthly_data is None:
             raise Exception("Total usage response was None (likely login/auth failure)")
         if not isinstance(monthly_data, dict):
-            raise Exception("Unexpected total usage response type=%s value=%r" % (type(monthly_data).__name__, monthly_data))
+            raise Exception(
+                f"Unexpected total usage response "
+                f"type={type(monthly_data).__name__} value={monthly_data!r}"
+            )
         if "total" not in monthly_data:
-            Logger.error("Total usage response missing 'total' key. Keys: %s. Full response: %s", list(monthly_data.keys()), monthly_data)
-            raise Exception("Total usage response missing 'total' key. Keys present: %s" % list(monthly_data.keys()))
+            keys = list(monthly_data.keys())
+            Logger.error(
+                "Total usage response missing 'total' key. Keys: %s. Full response: %s",
+                keys,
+                monthly_data,
+            )
+            raise Exception(f"Total usage response missing 'total' key. Keys present: {keys}")
 
         d = monthly_data["total"]
         return TotalUsageRead(
-                amountOfEnergy = d["kwh"],
-                volumeOfEnergy = d["volumeOfEnergy"],
-                price = d["price"],
-            )
+            amountOfEnergy=d["kwh"],
+            volumeOfEnergy=d["volumeOfEnergy"],
+            price=d["price"],
+        )
 
-    async def async_get_daily_usage(self, start: datetime|None, end: datetime|None) -> List[DailyUsageRead]:
+    async def async_get_daily_usage(
+        self, start: datetime | None, end: datetime | None
+    ) -> list[DailyUsageRead]:
         daily_data = await self.async_get_data(start, end, "month")
         Logger.debug("Daily usage raw response: %s", daily_data)
 
         if daily_data is None:
             raise Exception("Daily usage response was None (likely login/auth failure)")
         if not isinstance(daily_data, dict):
-            raise Exception("Unexpected daily usage response type=%s value=%r" % (type(daily_data).__name__, daily_data))
+            raise Exception(
+                f"Unexpected daily usage response "
+                f"type={type(daily_data).__name__} value={daily_data!r}"
+            )
 
-        usageReads: List[DailyUsageRead] = []
+        usage_reads: list[DailyUsageRead] = []
 
         for d in daily_data:
             if d == "total":
                 continue
-            usageReads.append(DailyUsageRead(
-                date = datetime.strptime(d, INPUT_DATE_FORMAT).replace(tzinfo=paris_tz),
-                amountOfEnergy = daily_data[d]["kwh"],
-                volumeOfEnergy = daily_data[d]["volumeOfEnergy"],
-                price = daily_data[d]["price"],
-                ratio = daily_data[d]["ratio"],
-                temperature = daily_data[d]["temperature"],
+            usage_reads.append(
+                DailyUsageRead(
+                    date=datetime.strptime(d, INPUT_DATE_FORMAT).replace(tzinfo=paris_tz),
+                    amountOfEnergy=daily_data[d]["kwh"],
+                    volumeOfEnergy=daily_data[d]["volumeOfEnergy"],
+                    price=daily_data[d]["price"],
+                    ratio=daily_data[d]["ratio"],
+                    temperature=daily_data[d]["temperature"],
+                )
+            )
 
-            ))
-        
-        # Logger.debug("Data transformed: %s", usageReads)
-        return usageReads
+        return usage_reads
 
-
-    async def async_get_data(self, start: datetime|None, end: datetime|None, scale: str) -> Any:
+    async def async_get_data(self, start: datetime | None, end: datetime | None, scale: str) -> Any:
         try:
             if self._token is None:
                 await self.async_login()
@@ -140,13 +177,8 @@ class Gazdebordeaux:
                 "Connection": "keep-alive",
                 "Content-Type": "application/json",
             }
-            payload = {
-                "email":self._username,
-                "password":self._password
-            }
-            params = {
-                "scale": scale
-            }
+            payload = {"email": self._username, "password": self._password}
+            params = {"scale": scale}
             if start is not None:
                 params["startDate"] = start.strftime("%Y-%m-%d")
             if end is not None:
@@ -162,13 +194,24 @@ class Gazdebordeaux:
 
             url = DATA_URL.format(house)
             Logger.debug("Fetching data url=%s params=%s", url, params)
-            async with self._session.get(url, headers=headers, json=payload, params=params) as response:
+            async with self._session.get(
+                url, headers=headers, json=payload, params=params
+            ) as response:
                 body = await response.text()
-                Logger.debug("Data response status=%s content-type=%s body=%s", response.status, response.headers.get("Content-Type"), body)
+                Logger.debug(
+                    "Data response status=%s content-type=%s body=%s",
+                    response.status,
+                    response.headers.get("Content-Type"),
+                    body,
+                )
                 try:
                     return await response.json(content_type=None)
-                except JSONDecodeError:
-                    raise Exception("Data response was not JSON (status=%s, content-type=%s): %s" % (response.status, response.headers.get("Content-Type"), body))
+                except JSONDecodeError as err:
+                    raise Exception(
+                        f"Data response was not JSON "
+                        f"(status={response.status}, "
+                        f"content-type={response.headers.get('Content-Type')}): {body}"
+                    ) from err
 
         except Exception:
             Logger.error("An unexpected error occured while loading the data", exc_info=True)
@@ -201,7 +244,10 @@ class Gazdebordeaux:
         if not houses:
             raise Exception("No houses found on this account")
 
-        Logger.debug("No selectedHouse; iterating over %d houses to find a gas contract", len(houses))
+        Logger.debug(
+            "No selectedHouse; iterating over %d houses to find a gas contract",
+            len(houses),
+        )
         seen: list[tuple[str, str | None]] = []
         for path in houses:
             house = await self._fetch_house(path)

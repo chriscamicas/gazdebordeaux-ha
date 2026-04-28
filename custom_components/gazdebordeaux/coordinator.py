@@ -1,42 +1,39 @@
 """Coordinator to handle Opower connections."""
-from datetime import datetime, timedelta
+
 import logging
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any, cast
 
-from .const import RESET_STATISTICS, HOUSE
-from .gazdebordeaux import Gazdebordeaux, DailyUsageRead, TotalUsageRead
-
 from homeassistant.components.recorder.models import (
     StatisticData,
+    StatisticMeanType,
     StatisticMetaData,
-    StatisticMeanType
 )
-from homeassistant.components.recorder.util import get_instance
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
-    statistics_during_period
+    statistics_during_period,
 )
+from homeassistant.components.recorder.util import get_instance
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntries, ConfigEntry
-# from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, UnitOfEnergy, UnitOfVolume, UnitOfCurrency
 from homeassistant.const import (
     CONF_PASSWORD,
     CONF_USERNAME,
+    CURRENCY_EURO,
     UnitOfEnergy,
     UnitOfVolume,
-    CURRENCY_EURO
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN
+from .const import DOMAIN, HOUSE, RESET_STATISTICS
+from .gazdebordeaux import DailyUsageRead, Gazdebordeaux, TotalUsageRead
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -71,14 +68,14 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             entry_data[CONF_USERNAME],
             entry_data[CONF_PASSWORD],
             None,
-            house
+            house,
         )
         self.reset = False
         if RESET_STATISTICS in entry_data:
             self.reset = bool(entry_data[RESET_STATISTICS])
             if self.reset:
                 _LOGGER.debug("Asked to reset all statistics...")
-                entries=self.hass.config_entries.async_entries(DOMAIN)
+                entries = self.hass.config_entries.async_entries(DOMAIN)
 
                 house: Any = None
                 if HOUSE in entry_data:
@@ -86,12 +83,13 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
 
                 _LOGGER.debug("Updating config...")
                 self.hass.config_entries.async_update_entry(
-                    entries[0], data={
+                    entries[0],
+                    data={
                         CONF_USERNAME: entry_data[CONF_USERNAME],
                         CONF_PASSWORD: entry_data[CONF_PASSWORD],
                         RESET_STATISTICS: False,
                         HOUSE: house,
-                    }
+                    },
                 )
 
         @callback
@@ -116,7 +114,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         except Exception as err:
             raise ConfigEntryAuthFailed from err
 
-        totalUsage: TotalUsageRead = await self.api.async_get_total_usage()
+        total_usage: TotalUsageRead = await self.api.async_get_total_usage()
 
         # Because Opower provides historical usage/cost with a delay of a couple of days
         # we need to insert data into statistics.
@@ -126,7 +124,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         self.last_update = datetime.now()
         _LOGGER.debug("Last update: %s", self.last_update.strftime("%Y-%m-%d %H:%M:%S"))
 
-        return totalUsage
+        return total_usage
 
     async def _insert_statistics(self) -> None:
         """Insert gdb statistics."""
@@ -137,7 +135,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             "Updating Statistics for %s, %s and %s",
             cost_statistic_id,
             consumption_statistic_id,
-            volume_statistic_id
+            volume_statistic_id,
         )
 
         if self.reset:
@@ -154,16 +152,14 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             volume_sum = 0.0
             last_stat_ts = None
         else:
-            last_stat_ts = last_stat[consumption_statistic_id][0]["start"] # type: ignore
+            last_stat_ts = last_stat[consumption_statistic_id][0]["start"]  # type: ignore
             last_stat_date = datetime.fromtimestamp(last_stat_ts)
             _LOGGER.debug("Last stat found for %s...", last_stat_date.strftime("%Y-%m-%d"))
-            usage_reads = await self._async_get_recent_usage_reads(
-                last_stat_ts
-            )
+            usage_reads = await self._async_get_recent_usage_reads(last_stat_ts)
             if not usage_reads:
                 _LOGGER.debug("No recent usage/cost data. Skipping update")
                 return
-            
+
             stats = await get_instance(self.hass).async_add_executor_job(
                 statistics_during_period,
                 self.hass,
@@ -175,8 +171,8 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
                 {"state", "sum"},
             )
             # s:StatisticsRow =stats[cost_statistic_id][0]
-            
-            cost_sum = cast(float, stats[cost_statistic_id][0]["sum"]) # type: ignore
+
+            cost_sum = cast(float, stats[cost_statistic_id][0]["sum"])  # type: ignore
             consumption_sum = cast(float, stats[consumption_statistic_id][0]["sum"])  # type: ignore
             volume_sum = cast(float, stats[volume_statistic_id][0]["sum"])  # type: ignore
             # last_stat_ts = stats[cost_statistic_id][0]["start"]  # type: ignore
@@ -187,44 +183,31 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
 
         for usage_read in usage_reads:
             start = usage_read.date
-            start.tzinfo
             if last_stat_ts is not None:
                 if start.timestamp() <= last_stat_ts:
                     _LOGGER.debug("Skipping data for %s (timestamp)", start.strftime("%Y-%m-%d"))
                     continue
-                # if we are on the same day, skip it as well regarding of the time (to prevent multiple run for the same day)
+                # Same day, skip regardless of time (avoid multiple runs for the same day).
                 if start.date() == last_stat_date.date():
                     _LOGGER.debug("Skipping data for %s (same date)", start.strftime("%Y-%m-%d"))
                     continue
-            
+
             _LOGGER.debug("Importing data for %s...", start.strftime("%Y-%m-%d"))
 
             cost_sum += usage_read.price
             consumption_sum += usage_read.amountOfEnergy
             volume_sum += usage_read.volumeOfEnergy
 
-            cost_statistics.append(
-                StatisticData(
-                    start=start, state=usage_read.price, sum=cost_sum
-                )
-            )
+            cost_statistics.append(StatisticData(start=start, state=usage_read.price, sum=cost_sum))
             consumption_statistics.append(
-                StatisticData(
-                    start=start, state=usage_read.amountOfEnergy, sum=consumption_sum
-                )
+                StatisticData(start=start, state=usage_read.amountOfEnergy, sum=consumption_sum)
             )
             volume_statistics.append(
-                StatisticData(
-                    start=start, state=usage_read.volumeOfEnergy, sum=volume_sum
-                )
+                StatisticData(start=start, state=usage_read.volumeOfEnergy, sum=volume_sum)
             )
 
-        name_prefix = " ".join(
-            (
-                "Gaz de Bordeaux",
-            )
-        )
-        
+        name_prefix = " ".join(("Gaz de Bordeaux",))
+
         cost_metadata = StatisticMetaData(
             has_mean=False,
             mean_type=StatisticMeanType.NONE,
@@ -236,7 +219,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             statistic_id=cost_statistic_id,
             unit_of_measurement=CURRENCY_EURO,
             device_class=SensorDeviceClass.MONETARY,
-            state_class=SensorStateClass.TOTAL
+            state_class=SensorStateClass.TOTAL,
         )
         consumption_metadata = StatisticMetaData(
             has_mean=False,
@@ -248,7 +231,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             statistic_id=consumption_statistic_id,
             unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
             device_class=SensorDeviceClass.ENERGY,
-            state_class=SensorStateClass.TOTAL
+            state_class=SensorStateClass.TOTAL,
         )
         volume_metadata = StatisticMetaData(
             has_mean=False,
@@ -260,7 +243,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             statistic_id=volume_statistic_id,
             unit_of_measurement=UnitOfVolume.CUBIC_METERS,
             device_class=SensorDeviceClass.GAS,
-            state_class=SensorStateClass.TOTAL
+            state_class=SensorStateClass.TOTAL,
         )
 
         async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
@@ -268,7 +251,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         async_add_external_statistics(self.hass, volume_metadata, volume_statistics)
 
     async def _async_get_all_data(self) -> list[DailyUsageRead]:
-        """Get all cost reads since account activation but at different resolutions depending on age.
+        """Get all cost reads since account activation, at different resolutions by age.
 
         - month resolution for all years (since account activation)
         - day resolution for past 3 years (if account's read resolution supports it)
@@ -277,7 +260,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         usage_reads = []
 
         # if start=None it will only default to beginning of current year, let's import 1 year more
-        start = datetime(datetime.today().year-1, 1, 1)
+        start = datetime(datetime.today().year - 1, 1, 1)
         end = datetime.now()
         usage_reads = await self.api.async_get_daily_usage(start, end)
         return usage_reads

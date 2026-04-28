@@ -1,20 +1,13 @@
 """Support for Opower sensors."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-from .gazdebordeaux import TotalUsageRead
-
-from homeassistant.components.sensor.const import (
-    SensorDeviceClass,
-    SensorStateClass
-)
-from homeassistant.components.sensor import (
-    SensorEntity,
-    SensorEntityDescription
-)
+from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
+from homeassistant.components.sensor.const import SensorDeviceClass, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import HomeAssistant
@@ -26,6 +19,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .coordinator import GdbCoordinator
+from .gazdebordeaux import TotalUsageRead
 
 
 @dataclass
@@ -85,10 +79,10 @@ async def async_setup_entry(
     coordinator: GdbCoordinator = hass.data[DOMAIN][entry.entry_id]
     entities: list[GdbSensor | GdbLastUpdateSensor] = []
 
-    device_id = f"gazpar"
+    device_id = "gazpar"
     device = DeviceInfo(
         identifiers={(DOMAIN, device_id)},
-        name=f"Gaz de Bordeaux",
+        name="Gaz de Bordeaux",
         manufacturer="Regaz",
         model="gazpar",
         entry_type=DeviceEntryType.SERVICE,
@@ -106,9 +100,7 @@ async def async_setup_entry(
         )
 
     # Ajout du sensor de dernière actualisation
-    entities.append(
-        GdbLastUpdateSensor(coordinator, device, device_id)
-    )
+    entities.append(GdbLastUpdateSensor(coordinator, device, device_id))
 
     async_add_entities(entities)
 
@@ -137,9 +129,7 @@ class GdbSensor(CoordinatorEntity[GdbCoordinator], SensorEntity):
     def native_value(self) -> StateType:
         """Return the state."""
         if self.coordinator.data is not None:
-            return self.entity_description.value_fn(
-                self.coordinator.data
-            )
+            return self.entity_description.value_fn(self.coordinator.data)
         return None
 
 
