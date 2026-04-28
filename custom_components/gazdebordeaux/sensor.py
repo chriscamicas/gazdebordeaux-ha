@@ -22,16 +22,14 @@ from .coordinator import GdbCoordinator
 from .gazdebordeaux import TotalUsageRead
 
 
-@dataclass
-class GdbEntityDescriptionMixin:
-    """Mixin values for required keys."""
+# SensorEntityDescription tightens device_class / state_class / etc. relative to
+# the base EntityDescription, so the synthesized `__replace__` here doesn't
+# match the grandparent's signature. Same pattern as HA core's `nrgkick` etc.
+@dataclass(frozen=True, kw_only=True)
+class GdbEntityDescription(SensorEntityDescription):  # type: ignore[override]
+    """Class describing Gaz de Bordeaux sensor entities."""
 
     value_fn: Callable[[TotalUsageRead], str | float]
-
-
-@dataclass
-class GdbEntityDescription(SensorEntityDescription, GdbEntityDescriptionMixin):
-    """Class describing Gaz de Bordeaux sensors entities."""
 
 
 # suggested_display_precision=0 for all sensors since
