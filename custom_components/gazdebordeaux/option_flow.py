@@ -1,24 +1,22 @@
 """Options flow for Gazdebordeaux integration."""
+
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import voluptuous as vol
-
-from homeassistant.config_entries import OptionsFlow, ConfigEntry, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
-from .const import DOMAIN, RESET_STATISTICS, HOUSE
+from .const import HOUSE, RESET_STATISTICS
 from .gazdebordeaux import Gazdebordeaux
 
 _LOGGER = logging.getLogger(__name__)
 
-async def _validate_login(
-    hass: HomeAssistant, login_data: dict[str, str]
-) -> dict[str, str]:
+
+async def _validate_login(hass: HomeAssistant, login_data: dict[str, str]) -> dict[str, str]:
     """Validate login data and return any errors."""
     api = Gazdebordeaux(
         async_create_clientsession(hass),
@@ -44,9 +42,7 @@ class GazdebordeauxOptionFlow(OptionsFlow):
         # HA le gère en interne via la classe parente
         self._user_inputs: dict = {}  # Attribut d'instance
 
-    async def async_step_init(
-        self, user_input: dict | None = None
-    ) -> ConfigFlowResult:
+    async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
         """Gestion de l'étape 'init'."""
 
         option_form = vol.Schema(
@@ -78,9 +74,7 @@ class GazdebordeauxOptionFlow(OptionsFlow):
             return self.async_show_form(step_id="init", data_schema=option_form)
 
         # 2ème appel : il y a des user_input -> on stocke le résultat
-        _LOGGER.debug(
-            "option_flow step user (2). Valeurs reçues: %s", user_input
-        )
+        _LOGGER.debug("option_flow step user (2). Valeurs reçues: %s", user_input)
         # On mémorise les user_input
         self._user_inputs.update(user_input)
 
@@ -96,8 +90,6 @@ class GazdebordeauxOptionFlow(OptionsFlow):
         )
 
         # Modification de la configEntry avec nos nouvelles valeurs
-        self.hass.config_entries.async_update_entry(
-            self.config_entry, data=self._user_inputs
-        )
+        self.hass.config_entries.async_update_entry(self.config_entry, data=self._user_inputs)
 
         return self.async_create_entry(title="", data={})
