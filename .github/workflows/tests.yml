@@ -45,6 +45,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements_test.txt
+          # Runtime deps live in manifest.json (HA convention); install them too.
+          pip install $(python -c "import json; print(' '.join(json.load(open('custom_components/gazdebordeaux/manifest.json'))['requirements']))")
 
       - name: Run pytest
         run: pytest -v --cov=custom_components/gazdebordeaux --cov-report=term-missing
