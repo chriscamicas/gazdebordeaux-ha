@@ -1,9 +1,10 @@
 """Coordinator to handle Opower connections."""
 
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from types import MappingProxyType
-from typing import Any, cast
+from typing import cast
 
 from homeassistant.components.recorder.models import (
     StatisticData,
@@ -16,6 +17,7 @@ from homeassistant.components.recorder.statistics import (
     statistics_during_period,
 )
 from homeassistant.components.recorder.util import get_instance
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_PASSWORD,
     CONF_USERNAME,
@@ -28,19 +30,89 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN, HOUSE, RESET_STATISTICS
-from .gazdebordeaux import DailyUsageRead, Gazdebordeaux, TotalUsageRead
+from .const import (
+    AUTO,
+    DOMAIN,
+    ENERGY_ELECTRICITY,
+    ENERGY_GAS,
+    ENERGY_HOUSE_KEYS,
+    NONE,
+    RESET_STATISTICS,
+)
+from .gazdebordeaux import DailyUsageRead, Gazdebordeaux, TotalUsageRead, paris_tz
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
+def _has_usage(usage_reads: list[DailyUsageRead]) -> bool:
+    return any(read.amountOfEnergy or read.price for read in usage_reads)
+
+
+@dataclass(frozen=True)
+class StatisticSpec:
+    """One external statistic fed from the daily usage reads."""
+
+    statistic_id: str
+    name: str
+    # Must be a recorder unit converter class, or None (e.g. currencies).
+    unit_class: str | None
+    unit: str
+    value_fn: Callable[[DailyUsageRead], float]
+
+
+# The first spec of each energy is the one used to find the last imported day.
+# Gas statistic ids predate electricity support: keep them unchanged so existing
+# installs keep their history.
+ENERGY_STATISTICS: dict[str, tuple[StatisticSpec, ...]] = {
+    ENERGY_GAS: (
+        StatisticSpec(
+            f"{DOMAIN}:energy_consumption",
+            "Gaz de Bordeaux consumption",
+            "energy",
+            UnitOfEnergy.KILO_WATT_HOUR,
+            lambda read: read.amountOfEnergy,
+        ),
+        StatisticSpec(
+            f"{DOMAIN}:energy_cost",
+            "Gaz de Bordeaux cost",
+            None,
+            CURRENCY_EURO,
+            lambda read: read.price,
+        ),
+        StatisticSpec(
+            f"{DOMAIN}:volume",
+            "Gaz de Bordeaux volume",
+            "volume",
+            UnitOfVolume.CUBIC_METERS,
+            lambda read: read.volumeOfEnergy,
+        ),
+    ),
+    ENERGY_ELECTRICITY: (
+        StatisticSpec(
+            f"{DOMAIN}:electricity_consumption",
+            "Gaz de Bordeaux electricity consumption",
+            "energy",
+            UnitOfEnergy.KILO_WATT_HOUR,
+            lambda read: read.amountOfEnergy,
+        ),
+        StatisticSpec(
+            f"{DOMAIN}:electricity_cost",
+            "Gaz de Bordeaux electricity cost",
+            None,
+            CURRENCY_EURO,
+            lambda read: read.price,
+        ),
+    ),
+}
+
+
+class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
     """Handle fetching GazdeBordeaux data, updating sensors and inserting statistics."""
 
     def __init__(
         self,
         hass: HomeAssistant,
-        entry_data: MappingProxyType[str, Any],
+        entry: ConfigEntry,
     ) -> None:
         """Initialize the data handler."""
         super().__init__(
@@ -55,33 +127,28 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         # Initialisation de la date de dernière actualisation
         self.last_update: datetime | None = None
 
-        house: Any = None
-        if HOUSE in entry_data:
-            house = entry_data[HOUSE]
+        entry_data = entry.data
+
+        # House path per configured energy; AUTO is resolved on first refresh.
+        self.houses: dict[str, str] = {
+            energy: entry_data[key]
+            for energy, key in ENERGY_HOUSE_KEYS.items()
+            if entry_data.get(key) and entry_data[key] != NONE
+        }
 
         self.api = Gazdebordeaux(
             aiohttp_client.async_get_clientsession(hass),
             entry_data[CONF_USERNAME],
             entry_data[CONF_PASSWORD],
-            None,
-            house,
         )
         self.reset = False
         if RESET_STATISTICS in entry_data:
             self.reset = bool(entry_data[RESET_STATISTICS])
             if self.reset:
                 _LOGGER.debug("Asked to reset all statistics...")
-                entries = self.hass.config_entries.async_entries(DOMAIN)
-
                 _LOGGER.debug("Updating config...")
                 self.hass.config_entries.async_update_entry(
-                    entries[0],
-                    data={
-                        CONF_USERNAME: entry_data[CONF_USERNAME],
-                        CONF_PASSWORD: entry_data[CONF_PASSWORD],
-                        RESET_STATISTICS: False,
-                        HOUSE: house,
-                    },
+                    entry, data={**entry_data, RESET_STATISTICS: False}
                 )
 
         @callback
@@ -96,7 +163,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
 
     async def _async_update_data(
         self,
-    ) -> TotalUsageRead:
+    ) -> dict[str, TotalUsageRead]:
         """Fetch data from API endpoint."""
         try:
             # Login expires after a few minutes.
@@ -106,48 +173,58 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         except Exception as err:
             raise ConfigEntryAuthFailed from err
 
-        total_usage: TotalUsageRead = await self.api.async_get_total_usage()
+        data: dict[str, TotalUsageRead] = {}
+        for energy in self.houses:
+            if self.houses[energy] == AUTO:
+                self.houses[energy] = await self.api.async_find_house(energy)
+            house = self.houses[energy]
 
-        # Because Opower provides historical usage/cost with a delay of a couple of days
-        # we need to insert data into statistics.
-        await self._insert_statistics()
+            data[energy] = await self.api.async_get_total_usage(house)
+
+            # Because Opower provides historical usage/cost with a delay of a couple of days
+            # we need to insert data into statistics.
+            await self._insert_statistics(energy, house)
 
         # Mise à jour de la date de dernière actualisation
         self.last_update = datetime.now()
         _LOGGER.debug("Last update: %s", self.last_update.strftime("%Y-%m-%d %H:%M:%S"))
 
-        return total_usage
+        return data
 
-    async def _insert_statistics(self) -> None:
-        """Insert gdb statistics."""
-        cost_statistic_id = f"{DOMAIN}:energy_cost"
-        consumption_statistic_id = f"{DOMAIN}:energy_consumption"
-        volume_statistic_id = f"{DOMAIN}:volume"
-        _LOGGER.debug(
-            "Updating Statistics for %s, %s and %s",
-            cost_statistic_id,
-            consumption_statistic_id,
-            volume_statistic_id,
-        )
+    async def _insert_statistics(self, energy: str, house: str) -> None:
+        """Insert gdb statistics for one energy type."""
+        specs = ENERGY_STATISTICS[energy]
+        statistic_ids = {spec.statistic_id for spec in specs}
+        anchor_statistic_id = specs[0].statistic_id
+        _LOGGER.debug("Updating Statistics for %s", ", ".join(sorted(statistic_ids)))
 
         if self.reset:
             _LOGGER.debug("Resetting all statistics...")
 
         last_stat = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, consumption_statistic_id, True, set()
+            get_last_statistics, self.hass, 1, anchor_statistic_id, True, set()
         )
+        sums: dict[str, float]
         if not last_stat:
             _LOGGER.debug("Updating statistic for the first time")
-            usage_reads = await self._async_get_all_data()
-            cost_sum = 0.0
-            consumption_sum = 0.0
-            volume_sum = 0.0
+            usage_reads = await self._async_get_all_data(house)
+            if not _has_usage(usage_reads):
+                await self._insert_monthly_statistics(specs, house, None)
+                return
+            sums = {statistic_id: 0.0 for statistic_id in statistic_ids}
             last_stat_ts = None
         else:
-            last_stat_ts = last_stat[consumption_statistic_id][0]["start"]  # type: ignore
+            last_stat_ts = last_stat[anchor_statistic_id][0]["start"]  # type: ignore
             last_stat_date = datetime.fromtimestamp(last_stat_ts)
             _LOGGER.debug("Last stat found for %s...", last_stat_date.strftime("%Y-%m-%d"))
-            usage_reads = await self._async_get_recent_usage_reads(last_stat_ts)
+            usage_reads = await self._async_get_recent_usage_reads(house, last_stat_ts)
+            # Zero recent days can be genuine (e.g. no gas used): only fall back
+            # to monthly data when the whole daily history is empty.
+            if not _has_usage(usage_reads) and not _has_usage(
+                await self._async_get_all_data(house)
+            ):
+                await self._insert_monthly_statistics(specs, house, last_stat_ts)
+                return
             if not usage_reads:
                 _LOGGER.debug("No recent usage/cost data. Skipping update")
                 return
@@ -157,21 +234,19 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
                 self.hass,
                 usage_reads[0].date,
                 None,
-                {cost_statistic_id, consumption_statistic_id, volume_statistic_id},
+                statistic_ids,
                 "day",
                 None,
                 {"state", "sum"},
             )
-            # s:StatisticsRow =stats[cost_statistic_id][0]
+            sums = {
+                statistic_id: cast(float, stats[statistic_id][0]["sum"])  # type: ignore
+                for statistic_id in statistic_ids
+            }
 
-            cost_sum = cast(float, stats[cost_statistic_id][0]["sum"])  # type: ignore
-            consumption_sum = cast(float, stats[consumption_statistic_id][0]["sum"])  # type: ignore
-            volume_sum = cast(float, stats[volume_statistic_id][0]["sum"])  # type: ignore
-            # last_stat_ts = stats[cost_statistic_id][0]["start"]  # type: ignore
-
-        cost_statistics = []
-        consumption_statistics = []
-        volume_statistics = []
+        statistics: dict[str, list[StatisticData]] = {
+            statistic_id: [] for statistic_id in statistic_ids
+        }
 
         for usage_read in usage_reads:
             start = usage_read.date
@@ -186,53 +261,92 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
 
             _LOGGER.debug("Importing data for %s...", start.strftime("%Y-%m-%d"))
 
-            cost_sum += usage_read.price
-            consumption_sum += usage_read.amountOfEnergy
-            volume_sum += usage_read.volumeOfEnergy
+            for spec in specs:
+                value = spec.value_fn(usage_read)
+                sums[spec.statistic_id] += value
+                statistics[spec.statistic_id].append(
+                    StatisticData(start=start, state=value, sum=sums[spec.statistic_id])
+                )
 
-            cost_statistics.append(StatisticData(start=start, state=usage_read.price, sum=cost_sum))
-            consumption_statistics.append(
-                StatisticData(start=start, state=usage_read.amountOfEnergy, sum=consumption_sum)
+        self._add_statistics(specs, statistics)
+
+    async def _insert_monthly_statistics(
+        self, specs: tuple[StatisticSpec, ...], house: str, last_stat_ts: float | None
+    ) -> None:
+        """Insert one statistic per month, for contracts without daily data.
+
+        Months are rewritten from the one before the last imported month, so the
+        current (partial) month and late corrections are picked up on each refresh.
+        """
+        statistic_ids = {spec.statistic_id for spec in specs}
+        now = datetime.now()
+        if last_stat_ts is None:
+            start = datetime(now.year - 1, 1, 1)
+            sums = {statistic_id: 0.0 for statistic_id in statistic_ids}
+        else:
+            last_stat_date = datetime.fromtimestamp(last_stat_ts, paris_tz)
+            last_month = datetime(last_stat_date.year, last_stat_date.month, 1)
+            start = (last_month - timedelta(days=1)).replace(day=1)
+            sums = await self._async_get_sums_before(statistic_ids, start.replace(tzinfo=paris_tz))
+        _LOGGER.debug("No daily data, importing monthly data since %s", start.strftime("%Y-%m"))
+
+        usage_reads = await self.api.async_get_monthly_usage(house, start, now)
+
+        statistics: dict[str, list[StatisticData]] = {
+            statistic_id: [] for statistic_id in statistic_ids
+        }
+        for usage_read in usage_reads:
+            if usage_read.date.replace(tzinfo=None) < start:
+                continue
+            _LOGGER.debug("Importing data for %s...", usage_read.date.strftime("%Y-%m"))
+            for spec in specs:
+                value = spec.value_fn(usage_read)
+                sums[spec.statistic_id] += value
+                statistics[spec.statistic_id].append(
+                    StatisticData(start=usage_read.date, state=value, sum=sums[spec.statistic_id])
+                )
+
+        self._add_statistics(specs, statistics)
+
+    async def _async_get_sums_before(
+        self, statistic_ids: set[str], before: datetime
+    ) -> dict[str, float]:
+        """Return each statistic's running sum just before `before` (0 if none)."""
+        stats = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            before - timedelta(days=62),
+            before,
+            statistic_ids,
+            "hour",
+            None,
+            {"sum"},
+        )
+        return {
+            statistic_id: float(stats[statistic_id][-1]["sum"] or 0.0)  # type: ignore
+            if stats.get(statistic_id)
+            else 0.0
+            for statistic_id in statistic_ids
+        }
+
+    def _add_statistics(
+        self,
+        specs: tuple[StatisticSpec, ...],
+        statistics: dict[str, list[StatisticData]],
+    ) -> None:
+        for spec in specs:
+            metadata = StatisticMetaData(
+                mean_type=StatisticMeanType.NONE,
+                unit_class=spec.unit_class,
+                has_sum=True,
+                name=spec.name,
+                source=DOMAIN,
+                statistic_id=spec.statistic_id,
+                unit_of_measurement=spec.unit,
             )
-            volume_statistics.append(
-                StatisticData(start=start, state=usage_read.volumeOfEnergy, sum=volume_sum)
-            )
+            async_add_external_statistics(self.hass, metadata, statistics[spec.statistic_id])
 
-        name_prefix = " ".join(("Gaz de Bordeaux",))
-
-        cost_metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            unit_class="monetary",
-            has_sum=True,
-            name=f"{name_prefix} cost",
-            source=DOMAIN,
-            statistic_id=cost_statistic_id,
-            unit_of_measurement=CURRENCY_EURO,
-        )
-        consumption_metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            unit_class="energy",
-            has_sum=True,
-            name=f"{name_prefix} consumption",
-            source=DOMAIN,
-            statistic_id=consumption_statistic_id,
-            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        )
-        volume_metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            unit_class="volume",
-            has_sum=True,
-            name=f"{name_prefix} volume",
-            source=DOMAIN,
-            statistic_id=volume_statistic_id,
-            unit_of_measurement=UnitOfVolume.CUBIC_METERS,
-        )
-
-        async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-        async_add_external_statistics(self.hass, consumption_metadata, consumption_statistics)
-        async_add_external_statistics(self.hass, volume_metadata, volume_statistics)
-
-    async def _async_get_all_data(self) -> list[DailyUsageRead]:
+    async def _async_get_all_data(self, house: str) -> list[DailyUsageRead]:
         """Get all cost reads since account activation, at different resolutions by age.
 
         - month resolution for all years (since account activation)
@@ -244,12 +358,15 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         # if start=None it will only default to beginning of current year, let's import 1 year more
         start = datetime(datetime.today().year - 1, 1, 1)
         end = datetime.now()
-        usage_reads = await self.api.async_get_daily_usage(start, end)
+        usage_reads = await self.api.async_get_daily_usage(house, start, end)
         return usage_reads
 
-    async def _async_get_recent_usage_reads(self, last_stat_time: float) -> list[DailyUsageRead]:
+    async def _async_get_recent_usage_reads(
+        self, house: str, last_stat_time: float
+    ) -> list[DailyUsageRead]:
         """Get cost reads within the past 30 days to allow corrections in data from utilities."""
         return await self.api.async_get_daily_usage(
+            house,
             # datetime.fromtimestamp(last_stat_time) - timedelta(days=30),
             datetime.fromtimestamp(last_stat_time),
             datetime.now(),

@@ -1,0 +1,39 @@
+{
+    "2026-09-29": {
+        "kwh": 15,
+        "consumptionHp": 0,
+        "consumptionHc": 0,
+        "priceHp": 0,
+        "priceHc": 0,
+        "price": 3.4,
+        "volumeOfEnergy": 0,
+        "contractPrice": 0.52,
+        "consumptionPrice": 2.88,
+        "ratio": 0,
+        "kva": 0,
+        "isHphc": false,
+        "temperature": 24.9,
+        "co2": 0.29
+    },
+    "2026-09-30": {
+        "kwh": 0,
+        "price": 0,
+        "volumeOfEnergy": 0,
+        "ratio": 0,
+        "kva": 0,
+        "temperature": 20.1,
+        "co2": 0
+    },
+    "total": {
+        "kwh": 15,
+        "volumeOfEnergy": 0,
+        "co2": 0.29,
+        "kva": 0,
+        "price": 3.4,
+        "contractPrice": 0,
+        "consumptionHp": 0,
+        "consumptionHc": 0,
+        "priceHp": 0,
+        "priceHc": 0
+    }
+}

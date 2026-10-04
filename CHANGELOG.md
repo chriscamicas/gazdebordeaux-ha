@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-10-04
+- Add electricity consumption tracking: an electricity contract is imported into the `gazdebordeaux:electricity_consumption` and `gazdebordeaux:electricity_cost` statistics (Energy dashboard → Electricity grid consumption), with matching sensors on a new "Gaz de Bordeaux Électricité" device
+- Fall back to monthly statistics (one point per month, on the 1st) for contracts whose daily data is always 0, as observed on some electricity contracts; the last two months are rewritten on each refresh so the current month stays up to date
+- Pick the gas and electricity contracts from dropdowns listing every contract on the account, both during setup and from the options flow (replaces the free-text house field)
+- Migrate existing entries (config entry version 2): the gas contract is kept (or auto-detected by contract type), electricity tracking stays off until enabled in the options
+- Stop following the house last selected on the website: `selectedHouse` changes whenever you switch contracts on life.gazdebordeaux.fr, which could import electricity data into the gas statistics
+- Fix cost statistics being rejected by the recorder (`Unsupported unit_class: 'monetary'`, regression from 1.1.11); cost statistics use no unit class again
+- Reload the integration when the options are saved
+- Stop sending the credentials in the body of consumption requests
+
 ## [1.1.11] - 2026-04-28
 - Tag the cost statistic with `unit_class="monetary"` so the energy dashboard recognizes it as a currency series (was `None` before)
 - Drop deprecated `device_class` / `state_class` / `has_mean` keys from external statistic metadata; they're no longer accepted by the recorder's `StatisticMetaData` TypedDict in modern Home Assistant

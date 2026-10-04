@@ -12,6 +12,7 @@ LOGIN_URL = "https://life.gazdebordeaux.fr/api/login_check"
 ME_URL = "https://life.gazdebordeaux.fr/api/users/me"
 
 INPUT_DATE_FORMAT = "%Y-%m-%d"
+INPUT_MONTH_FORMAT = "%Y-%m"
 
 # Browser-like headers. The WAF on life.gazdebordeaux.fr rejects requests that
 # don't look like the SPA (same-origin fetch from the web app).
@@ -45,6 +46,20 @@ class TotalUsageRead:
 
 
 @dataclasses.dataclass
+class House:
+    path: str
+    category: str | None
+    name: str | None = None
+    contract_label: str | None = None
+    address: str | None = None
+
+    @property
+    def label(self) -> str:
+        parts = [self.name, self.contract_label, self.address]
+        return " - ".join(p for p in parts if p) or self.path
+
+
+@dataclasses.dataclass
 class DailyUsageRead:
     date: datetime
     amountOfEnergy: float
@@ -55,6 +70,19 @@ class DailyUsageRead:
 
 
 # ----------------------------------------------------------------------------
+def _normalize_house_path(house: str) -> str:
+    """Return the house path with the /api prefix exactly once.
+
+    Accounts return either "/houses/{uuid}" or "/api/houses/{uuid}".
+    """
+    if not house.startswith("/api/"):
+        if not house.startswith("/"):
+            house = "/" + house
+        house = "/api" + house
+    return house
+
+
+# ----------------------------------------------------------------------------
 class Gazdebordeaux:
     def __init__(
         self,
@@ -62,13 +90,11 @@ class Gazdebordeaux:
         username: str,
         password: str,
         token=None,
-        house=None,
     ):
         self._session = session
         self._username = username
         self._password = password
         self._token: str | None = token
-        self._selectedHouse: str | None = house
 
     async def async_login(self):
         Logger.debug("Loging in...")
@@ -99,8 +125,8 @@ class Gazdebordeaux:
             self._token = token["token"]
 
     # ------------------------------------------------------
-    async def async_get_total_usage(self):
-        monthly_data = await self.async_get_data(None, None, "year")
+    async def async_get_total_usage(self, house: str) -> TotalUsageRead:
+        monthly_data = await self.async_get_data(house, None, None, "year")
         Logger.debug("Total usage raw response: %s", monthly_data)
 
         if monthly_data is None:
@@ -122,16 +148,31 @@ class Gazdebordeaux:
         d = monthly_data["total"]
         return TotalUsageRead(
             amountOfEnergy=d["kwh"],
-            volumeOfEnergy=d["volumeOfEnergy"],
+            volumeOfEnergy=d.get("volumeOfEnergy", 0),
             price=d["price"],
         )
 
     async def async_get_daily_usage(
-        self, start: datetime | None, end: datetime | None
+        self, house: str, start: datetime | None, end: datetime | None
     ) -> list[DailyUsageRead]:
-        daily_data = await self.async_get_data(start, end, "month")
+        daily_data = await self.async_get_data(house, start, end, "month")
         Logger.debug("Daily usage raw response: %s", daily_data)
+        return self._parse_usage_reads(daily_data, INPUT_DATE_FORMAT)
 
+    async def async_get_monthly_usage(
+        self, house: str, start: datetime, end: datetime
+    ) -> list[DailyUsageRead]:
+        """Per-month reads, dated on the 1st of each month.
+
+        Some electricity contracts only expose monthly figures: the daily scale
+        returns every day at 0 while scale=year returns real monthly values.
+        """
+        monthly_data = await self.async_get_data(house, start, end, "year")
+        Logger.debug("Monthly usage raw response: %s", monthly_data)
+        return self._parse_usage_reads(monthly_data, INPUT_MONTH_FORMAT)
+
+    @staticmethod
+    def _parse_usage_reads(daily_data: Any, date_format: str) -> list[DailyUsageRead]:
         if daily_data is None:
             raise Exception("Daily usage response was None (likely login/auth failure)")
         if not isinstance(daily_data, dict):
@@ -145,57 +186,40 @@ class Gazdebordeaux:
         for d in daily_data:
             if d == "total":
                 continue
+            # Electricity contracts return the same shape as gas but with
+            # volumeOfEnergy/ratio at 0, and days without data may omit keys.
             usage_reads.append(
                 DailyUsageRead(
-                    date=datetime.strptime(d, INPUT_DATE_FORMAT).replace(tzinfo=paris_tz),
+                    date=datetime.strptime(d, date_format).replace(tzinfo=paris_tz),
                     amountOfEnergy=daily_data[d]["kwh"],
-                    volumeOfEnergy=daily_data[d]["volumeOfEnergy"],
+                    volumeOfEnergy=daily_data[d].get("volumeOfEnergy", 0),
                     price=daily_data[d]["price"],
-                    ratio=daily_data[d]["ratio"],
-                    temperature=daily_data[d]["temperature"],
+                    ratio=daily_data[d].get("ratio", 0),
+                    temperature=daily_data[d].get("temperature", 0),
                 )
             )
 
         return usage_reads
 
-    async def async_get_data(self, start: datetime | None, end: datetime | None, scale: str) -> Any:
+    async def async_get_data(
+        self, house: str, start: datetime | None, end: datetime | None, scale: str
+    ) -> Any:
         try:
             if self._token is None:
                 await self.async_login()
             if self._token is None:
                 return None
 
-            if self._selectedHouse is None:
-                await self.loadHouse()
-                Logger.debug("Loading last selected house")
-
-            Logger.debug("Loaded house info: %s", self._selectedHouse)
-
-            headers = {
-                **BROWSER_HEADERS,
-                "Authorization": "Bearer " + self._token,
-                "Connection": "keep-alive",
-                "Content-Type": "application/json",
-            }
-            payload = {"email": self._username, "password": self._password}
             params = {"scale": scale}
             if start is not None:
                 params["startDate"] = start.strftime("%Y-%m-%d")
             if end is not None:
                 params["endDate"] = end.strftime("%Y-%m-%d")
 
-            # selectedHouse can be "/houses/{uuid}" or "/api/houses/{uuid}" depending
-            # on the account; normalize to always include the /api prefix exactly once.
-            house = self._selectedHouse or ""
-            if not house.startswith("/api/"):
-                if not house.startswith("/"):
-                    house = "/" + house
-                house = "/api" + house
-
-            url = DATA_URL.format(house)
+            url = DATA_URL.format(_normalize_house_path(house))
             Logger.debug("Fetching data url=%s params=%s", url, params)
             async with self._session.get(
-                url, headers=headers, json=payload, params=params
+                url, headers=self._authenticated_headers(), params=params
             ) as response:
                 body = await response.text()
                 Logger.debug(
@@ -217,49 +241,60 @@ class Gazdebordeaux:
             Logger.error("An unexpected error occured while loading the data", exc_info=True)
             raise
 
-    async def loadHouse(self):
+    # ------------------------------------------------------
+    async def async_list_houses(self) -> list[House]:
+        """Return every house (contract) of the account with its category.
+
+        `selectedHouse` from /users/me is deliberately ignored: it reflects the
+        house last picked in the web UI, not a stable preference.
+        """
         if self._token is None:
             await self.async_login()
-        if self._token is None:
-            return
 
-        Logger.debug("Loading house info...")
-
-        # querying House id
+        Logger.debug("Loading houses...")
         async with self._session.get(ME_URL, headers=self._authenticated_headers()) as response:
             try:
-                data = await response.json()
-                Logger.debug("Loaded house info: %s", data)
+                data = await response.json(content_type=None)
+                Logger.debug("Loaded user info: %s", data)
             except JSONDecodeError:
-                Logger.error("An unexpected error occured while loading the house", exc_info=True)
+                Logger.error("An unexpected error occured while loading the houses", exc_info=True)
                 raise
 
-        if data.get("selectedHouse"):
-            self._selectedHouse = data["selectedHouse"]
-            return
-
-        # Multi-contract accounts (e.g. gas + electricity) come back with no
-        # selectedHouse. Iterate the houses list and pick the first gas one.
-        houses = data.get("houses") or []
-        if not houses:
+        paths = list(data.get("houses") or [])
+        if not paths and data.get("selectedHouse"):
+            paths = [data["selectedHouse"]]
+        if not paths:
             raise Exception("No houses found on this account")
 
-        Logger.debug(
-            "No selectedHouse; iterating over %d houses to find a gas contract",
-            len(houses),
-        )
-        seen: list[tuple[str, str | None]] = []
-        for path in houses:
-            house = await self._fetch_house(path)
-            category = (house.get("contractType") or {}).get("category")
-            seen.append((path, category))
-            Logger.debug("House %s category=%s", path, category)
-            if category == "gas":
-                Logger.debug("Selected gas house %s", path)
-                self._selectedHouse = path
-                return
+        houses: list[House] = []
+        for raw_path in paths:
+            path = _normalize_house_path(raw_path)
+            raw = await self._fetch_house(path) or {}
+            contract = raw.get("contractType") or {}
+            address = " ".join(
+                p for p in (raw.get("addressStreet"), raw.get("addressLocality")) if p
+            ).strip()
+            house = House(
+                path=path,
+                category=contract.get("category"),
+                name=raw.get("name"),
+                contract_label=contract.get("label"),
+                address=address or None,
+            )
+            Logger.debug("House %s category=%s", path, house.category)
+            houses.append(house)
+        return houses
 
-        raise Exception(f"No gas contract found among {len(houses)} houses: {seen}")
+    async def async_find_house(self, category: str) -> str:
+        """Return the path of the first house holding a `category` contract."""
+        houses = await self.async_list_houses()
+        for house in houses:
+            if house.category == category:
+                Logger.debug("Selected %s house %s", category, house.path)
+                return house.path
+
+        seen = [(h.path, h.category) for h in houses]
+        raise Exception(f"No {category} contract found among {len(houses)} houses: {seen}")
 
     def _authenticated_headers(self) -> dict:
         return {
