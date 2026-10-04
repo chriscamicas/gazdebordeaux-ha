@@ -1,0 +1,50 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "data": {
+                    "username": "Username",
+                    "password": "Password"
+                }
+            },
+            "contracts": {
+                "title": "Contracts",
+                "description": "Pick the contracts to track in the Energy dashboard",
+                "data": {
+                    "gas_house": "Gas contract",
+                    "electricity_house": "Electricity contract"
+                }
+            }
+        },
+        "error": {
+            "invalid_auth": "Invalid authentication",
+            "no_contract_selected": "Select at least one contract"
+        },
+        "abort": {
+            "already_configured": "Account is already configured",
+            "cannot_connect": "Unable to list the account's contracts"
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Existing configuration",
+                "description": "Update the configuration if needed",
+                "data": {
+                    "username": "Username",
+                    "password": "Password",
+                    "reset_stats": "Clear all statistics history",
+                    "gas_house": "Gas contract",
+                    "electricity_house": "Electricity contract"
+                }
+            }
+        },
+        "error": {
+            "invalid_auth": "Invalid authentication",
+            "no_contract_selected": "Select at least one contract"
+        },
+        "abort": {
+            "cannot_connect": "Unable to list the account's contracts"
+        }
+    }
+}

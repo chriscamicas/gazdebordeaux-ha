@@ -27,13 +27,29 @@ Copy the gazdebordeaux directory in HA config/custom_components/gazdebordeaux di
 After the installation, restart your HA application. You could now add the `Gaz De Bordeaux` directly like any other integration. You should be prompted with a form asking for your login and password.
 This is the login you should use to check your consumption on the following website: https://life.gazdebordeaux.fr/
 
+A second step lists the contracts on your account and asks which ones to track:
+
+- **Gas contract**: the gas contract to import, or `Aucun` (none).
+- **Electricity contract**: the electricity contract to import, or `Aucun` (none).
+
+Each dropdown preselects the first contract of its type. You can change the mapping later from the integration's **Configure** button.
+
 ## Home Assistant Energy module integration
 
 You probably want to integrate Gaz De Bordeaux data into the Home Assistant Energy module.
 
 ![Dashboard](images/energy_module.png)
 
-In Home Assistant energy configuration panel, you can set directly the sensor `gazdebordeaux:energy_consumption` in the gas consumption section, and `sensor.currently_bill_cost_to_date`
+In the Home Assistant energy configuration panel, pick these statistics:
+
+| Energy dashboard section | Consumption statistic | Cost statistic |
+| --- | --- | --- |
+| Gas consumption | `gazdebordeaux:energy_consumption` | `gazdebordeaux:energy_cost` |
+| Electricity grid consumption | `gazdebordeaux:electricity_consumption` | `gazdebordeaux:electricity_cost` |
+
+A `gazdebordeaux:volume` statistic (m³) is also available for gas.
+
+Some electricity contracts only expose monthly figures on Gaz de Bordeaux's side, and the website shows no daily data for them either. For those contracts the integration imports one value per month, dated on the 1st. Month and year views in the Energy dashboard are accurate, but day views show each month's total on its first day.
 
 ## Specific dashboard
 

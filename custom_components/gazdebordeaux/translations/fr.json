@@ -1,0 +1,50 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "data": {
+                    "username": "Nom d'utilisateur",
+                    "password": "Mot de passe"
+                }
+            },
+            "contracts": {
+                "title": "Contrats",
+                "description": "Choisissez les contrats à suivre dans le tableau de bord Énergie",
+                "data": {
+                    "gas_house": "Contrat gaz",
+                    "electricity_house": "Contrat électricité"
+                }
+            }
+        },
+        "error": {
+            "invalid_auth": "Identifiants invalides",
+            "no_contract_selected": "Sélectionnez au moins un contrat"
+        },
+        "abort": {
+            "already_configured": "Ce compte est déjà configuré",
+            "cannot_connect": "Impossible de récupérer les contrats du compte"
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Config. existante",
+                "description": "Modifiez éventuellement la configuration",
+                "data": {
+                    "username": "Nom d'utilisateur",
+                    "password": "Mot de passe",
+                    "reset_stats": "Efface tout l'historique de statistiques",
+                    "gas_house": "Contrat gaz",
+                    "electricity_house": "Contrat électricité"
+                }
+            }
+        },
+        "error": {
+            "invalid_auth": "Identifiants invalides",
+            "no_contract_selected": "Sélectionnez au moins un contrat"
+        },
+        "abort": {
+            "cannot_connect": "Impossible de récupérer les contrats du compte"
+        }
+    }
+}
