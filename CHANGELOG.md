@@ -5,7 +5,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.1.11] - 2026-04-28
-- Tag the cost statistic with `unit_class="monetary"` so the energy dashboard recognizes it as a currency series (was `None` before)
+- Import the cost statistic with `unit_class=None`: Home Assistant has no `"monetary"` unit class and rejected the whole import with "Unsupported unit_class: 'monetary'" (#47)
+- Import the consumption hour by hour from the Enedis load curve (`scale=day`, half-hourly average power in kW), from the curve's start (`hourlyMeasureStartDate`, at most two years back) on a full import, then day after day; a day whose hours do not add up to its daily read keeps the daily read
+- On the October clock change, fill the repeated 02:00-03:00 hour the load curve loses (its naive keys collide, leaving 49 points for 25 hours) with what the curve lacks to reach the daily read, so the day is imported hour by hour too
+- Poll Life every hour while the day it should publish next is missing, every 12 hours otherwise: Life publishes each day's reads two days later, during the day, so a 12 hour pace left Home Assistant up to 12 hours behind it
+- Peak / off-peak (HP/HC) contracts: four more statistics, `energy_consumption_hp`, `energy_consumption_hc`, `energy_cost_hp` and `energy_cost_hc`, with each half hour split by the contract's off-peak ranges (seasonal ones included) and priced at its own rate
+- Count `consumptionHp + consumptionHc` for HP/HC days that come with `kwh` and `price` at 0, as Life's own totals do
+- Start daily statistics at local midnight: pytz's `replace(tzinfo=...)` put every day at 23:51 UTC (Paris mean time); existing series are rebuilt once, on the hour
+- The "reset statistics" option now clears and rebuilds the statistics (it only logged before); a rebuild clears the old series only once the new data is downloaded
 - Drop deprecated `device_class` / `state_class` / `has_mean` keys from external statistic metadata; they're no longer accepted by the recorder's `StatisticMetaData` TypedDict in modern Home Assistant
 - Refactor `GdbEntityDescription` to the modern frozen+kw_only single-dataclass pattern (the old mixin shape doesn't compose with the now-frozen `EntityDescription`)
 
