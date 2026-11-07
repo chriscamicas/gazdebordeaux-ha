@@ -4,5 +4,5 @@
 pytest-homeassistant-custom-component>=0.13.316
 aioresponses==0.7.*
 ruff==0.16.*
-mypy==2.3.*
+mypy==2.4.*
 types-pytz
