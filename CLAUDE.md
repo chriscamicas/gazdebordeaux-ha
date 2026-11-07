@@ -44,7 +44,9 @@ The `selectedHouse` value comes back in two shapes depending on the account:
 
 ### Electricity payload
 
-Electricity `/consumptions` responses have the same shape as gas (`kwh`, `price`, `volumeOfEnergy`, `ratio`, `temperature`, …) with `volumeOfEnergy`/`ratio` at 0. Days or months without data may only carry a subset of keys, so read the optional ones with `.get()`. Some electricity contracts expose **no daily data at all**: `scale=month|week|day` return every day with `kwh: 0` (the website's own day/week charts are empty too), while `scale=year` with `startDate`/`endDate` returns real per-month figures keyed `YYYY-MM`. The coordinator detects this (daily history all zero) and imports monthly points instead (`_insert_monthly_statistics`), rewriting from the month before the last imported one on top of the running sum just before it. Recent zero days alone never trigger the fallback, because gas can legitimately have zero days. Known limitation: if such a contract later starts returning daily data, the daily path continues from the last monthly point, so that month gets double-counted. Clear the electricity statistics if that happens.
+Electricity `/consumptions` responses have the same shape as gas (`kwh`, `price`, `volumeOfEnergy`, `ratio`, `temperature`, …) with `volumeOfEnergy`/`ratio` at 0. Days or months without data may only carry a subset of keys, so read the optional ones with `.get()`. Some electricity contracts expose **no daily data at all**: `scale=month|week|day` return every day with `kwh: 0` (the website's own day/week charts are empty too), while `scale=year` with `startDate`/`endDate` returns real per-month figures keyed `YYYY-MM`. The coordinator detects this (daily history all zero) and imports monthly points instead (`_insert_monthly_statistics`), rewriting from the month before the last imported one on top of the running sum just before it. Recent zero days alone never trigger the fallback, because gas can legitimately have zero days.
+
+A contract can switch to daily data later, once the customer turns on daily reporting on the website. Daily history then starts on that day; it isn't backfilled. Observed in November 2026: zero every day through 4 Oct, real days from 5 Oct, and 1–4 Oct only present in October's `scale=year` figure. `_insert_full_history` handles that by importing monthly points for the months before the first day with data. It then adds a point on the 1st of that month holding the monthly figure minus the month's daily reads, followed by the daily reads, so totals match the website's. When an existing series is monthly (`_is_monthly_series`: the two newest points are a month apart, on the 1st) and daily data shows up, the series is cleared and rebuilt with `_insert_full_history`.
 
 Note that `DailyUsageRead.date` uses `.replace(tzinfo=paris_tz)` (pytz LMT, +00:09). Existing gas statistics are stored with that offset, so don't "fix" it to `localize()` without migrating them.
 
@@ -77,13 +79,7 @@ The coordinator runs every 12h but the JWT expires sooner, so `_async_update_dat
 
 ## Local testing
 
-`test_login.py` at the repo root drives `Gazdebordeaux` directly without any `homeassistant` import. Use it to repro API issues fast:
-
-```bash
-GDB_USERNAME=you@example.com GDB_PASSWORD='...' python test_login.py
-```
-
-Logging defaults to DEBUG in that script so you'll see request URLs, response status, content-type, and body for every call.
+There is no committed repro script any more. To hit the real API fast, write a throwaway script that puts `custom_components/gazdebordeaux` on `sys.path` and imports `gazdebordeaux` directly. That module has no `homeassistant` import, only `aiohttp` and `pytz`. Then drive `Gazdebordeaux(session, username, password)` with DEBUG logging, which shows request URLs, response status, content-type and body for every call.
 
 ## Versioning / changelog convention
 

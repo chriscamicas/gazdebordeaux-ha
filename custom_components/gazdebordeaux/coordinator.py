@@ -1,5 +1,6 @@
 """Coordinator to handle Opower connections."""
 
+import dataclasses
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -46,6 +47,44 @@ _LOGGER = logging.getLogger(__name__)
 
 def _has_usage(usage_reads: list[DailyUsageRead]) -> bool:
     return any(read.amountOfEnergy or read.price for read in usage_reads)
+
+
+def _month_of(read: DailyUsageRead) -> tuple[int, int]:
+    return (read.date.year, read.date.month)
+
+
+def _subtract(total: DailyUsageRead, parts: list[DailyUsageRead]) -> DailyUsageRead:
+    """`total` minus the sum of `parts`, keeping `total`'s date."""
+    return dataclasses.replace(
+        total,
+        amountOfEnergy=total.amountOfEnergy - sum(p.amountOfEnergy for p in parts),
+        volumeOfEnergy=total.volumeOfEnergy - sum(p.volumeOfEnergy for p in parts),
+        price=total.price - sum(p.price for p in parts),
+    )
+
+
+def _is_monthly_series(last_rows: list) -> bool:
+    """Whether the two newest points (newest first) are a month apart, on the 1st.
+
+    Monthly points are dated like the API parser dates them (midnight on the 1st,
+    see `DailyUsageRead.date`); daily series are one day apart.
+    """
+    if len(last_rows) < 2:
+        return False
+    newest, previous = (float(row["start"]) for row in last_rows[:2])
+    return newest - previous >= 27 * 86400 and all(
+        _is_first_of_month(ts) for ts in (newest, previous)
+    )
+
+
+def _is_first_of_month(ts: float) -> bool:
+    # pytz's replace() puts midnight at 23:51 CET the day before: shift by an hour
+    # to land on the right day whatever the offset, then compare exactly.
+    day = datetime.fromtimestamp(ts, paris_tz) + timedelta(hours=1)
+    return day.day == 1 and ts in (
+        datetime(day.year, day.month, 1).replace(tzinfo=paris_tz).timestamp(),
+        paris_tz.localize(datetime(day.year, day.month, 1)).timestamp(),
+    )
 
 
 @dataclass(frozen=True)
@@ -201,74 +240,129 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         if self.reset:
             _LOGGER.debug("Resetting all statistics...")
 
-        last_stat = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, anchor_statistic_id, True, set()
+        last_stats = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 2, anchor_statistic_id, True, set()
         )
-        sums: dict[str, float]
-        if not last_stat:
-            _LOGGER.debug("Updating statistic for the first time")
-            usage_reads = await self._async_get_all_data(house)
-            if not _has_usage(usage_reads):
-                await self._insert_monthly_statistics(specs, house, None)
-                return
-            sums = {statistic_id: 0.0 for statistic_id in statistic_ids}
-            last_stat_ts = None
-        else:
-            last_stat_ts = last_stat[anchor_statistic_id][0]["start"]  # type: ignore
-            last_stat_date = datetime.fromtimestamp(last_stat_ts)
-            _LOGGER.debug("Last stat found for %s...", last_stat_date.strftime("%Y-%m-%d"))
-            usage_reads = await self._async_get_recent_usage_reads(house, last_stat_ts)
-            # Zero recent days can be genuine (e.g. no gas used): only fall back
-            # to monthly data when the whole daily history is empty.
-            if not _has_usage(usage_reads) and not _has_usage(
-                await self._async_get_all_data(house)
-            ):
-                await self._insert_monthly_statistics(specs, house, last_stat_ts)
-                return
-            if not usage_reads:
-                _LOGGER.debug("No recent usage/cost data. Skipping update")
-                return
+        # Newest first.
+        last_rows = last_stats.get(anchor_statistic_id, [])
 
-            stats = await get_instance(self.hass).async_add_executor_job(
-                statistics_during_period,
-                self.hass,
-                usage_reads[0].date,
-                None,
-                statistic_ids,
-                "day",
-                None,
-                {"state", "sum"},
+        if last_rows and _is_monthly_series(last_rows):
+            all_reads = await self._async_get_all_data(house)
+            if not _has_usage(all_reads):
+                await self._insert_monthly_statistics(
+                    specs, house, cast(float, last_rows[0]["start"])
+                )
+                return
+            # The contract started returning daily data (e.g. the customer turned
+            # on daily reporting). Continuing from the last monthly point would
+            # count its month twice: rebuild the series from scratch instead.
+            _LOGGER.info(
+                "Daily data is now available for %s, rebuilding its statistics",
+                anchor_statistic_id,
             )
-            sums = {
-                statistic_id: cast(float, stats[statistic_id][0]["sum"])  # type: ignore
-                for statistic_id in statistic_ids
-            }
+            get_instance(self.hass).async_clear_statistics(sorted(statistic_ids))
+            await self._insert_full_history(specs, house, all_reads)
+            return
 
-        statistics: dict[str, list[StatisticData]] = {
-            statistic_id: [] for statistic_id in statistic_ids
+        if not last_rows:
+            _LOGGER.debug("Updating statistic for the first time")
+            await self._insert_full_history(specs, house, await self._async_get_all_data(house))
+            return
+
+        last_stat_ts = cast(float, last_rows[0]["start"])
+        last_stat_date = datetime.fromtimestamp(last_stat_ts)
+        _LOGGER.debug("Last stat found for %s...", last_stat_date.strftime("%Y-%m-%d"))
+        usage_reads = await self._async_get_recent_usage_reads(house, last_stat_ts)
+        # Zero recent days can be genuine (e.g. no gas used): only fall back
+        # to monthly data when the whole daily history is empty.
+        if not _has_usage(usage_reads) and not _has_usage(await self._async_get_all_data(house)):
+            await self._insert_monthly_statistics(specs, house, last_stat_ts)
+            return
+        if not usage_reads:
+            _LOGGER.debug("No recent usage/cost data. Skipping update")
+            return
+
+        stats = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            usage_reads[0].date,
+            None,
+            statistic_ids,
+            "day",
+            None,
+            {"state", "sum"},
+        )
+        sums = {
+            statistic_id: cast(float, stats[statistic_id][0]["sum"])  # type: ignore
+            for statistic_id in statistic_ids
         }
 
+        new_reads = []
         for usage_read in usage_reads:
             start = usage_read.date
-            if last_stat_ts is not None:
-                if start.timestamp() <= last_stat_ts:
-                    _LOGGER.debug("Skipping data for %s (timestamp)", start.strftime("%Y-%m-%d"))
-                    continue
-                # Same day, skip regardless of time (avoid multiple runs for the same day).
-                if start.date() == last_stat_date.date():
-                    _LOGGER.debug("Skipping data for %s (same date)", start.strftime("%Y-%m-%d"))
-                    continue
+            if start.timestamp() <= last_stat_ts:
+                _LOGGER.debug("Skipping data for %s (timestamp)", start.strftime("%Y-%m-%d"))
+                continue
+            # Same day, skip regardless of time (avoid multiple runs for the same day).
+            if start.date() == last_stat_date.date():
+                _LOGGER.debug("Skipping data for %s (same date)", start.strftime("%Y-%m-%d"))
+                continue
+            new_reads.append(usage_read)
 
-            _LOGGER.debug("Importing data for %s...", start.strftime("%Y-%m-%d"))
+        self._import_reads(specs, new_reads, sums)
 
-            for spec in specs:
-                value = spec.value_fn(usage_read)
-                sums[spec.statistic_id] += value
-                statistics[spec.statistic_id].append(
-                    StatisticData(start=start, state=value, sum=sums[spec.statistic_id])
-                )
+    async def _insert_full_history(
+        self,
+        specs: tuple[StatisticSpec, ...],
+        house: str,
+        daily_reads: list[DailyUsageRead],
+    ) -> None:
+        """Import the whole history into empty statistics.
 
-        self._add_statistics(specs, statistics)
+        Daily reads are used wherever they exist. A contract can have daily data
+        only from some point on (e.g. electricity once daily reporting is turned
+        on), with monthly-only figures before that. The months before the first
+        day with data then get one monthly point each, and that day's month gets
+        a point on the 1st for the part of the monthly figure the days don't
+        cover, so the totals match the website's.
+        """
+        if not _has_usage(daily_reads):
+            await self._insert_monthly_statistics(specs, house, None)
+            return
+
+        statistic_ids = {spec.statistic_id for spec in specs}
+        sums = {statistic_id: 0.0 for statistic_id in statistic_ids}
+        first_day = next(read for read in daily_reads if _has_usage([read])).date
+        first_month = (first_day.year, first_day.month)
+        start = min(read.date for read in daily_reads).replace(tzinfo=None)
+        if (start.year, start.month) >= first_month:
+            self._import_reads(specs, daily_reads, sums)
+            return
+
+        monthly_reads = await self.api.async_get_monthly_usage(house, start, datetime.now())
+        before = [read for read in monthly_reads if _month_of(read) < first_month]
+        if not _has_usage(before):
+            # Plain daily contract whose history starts later (e.g. a new contract).
+            self._import_reads(specs, daily_reads, sums)
+            return
+
+        _LOGGER.debug(
+            "Daily data starts on %s, importing monthly data before it",
+            first_day.strftime("%Y-%m-%d"),
+        )
+        daily_from = [read for read in daily_reads if _month_of(read) >= first_month]
+        transition = next((read for read in monthly_reads if _month_of(read) == first_month), None)
+        if transition is not None:
+            # The point on the 1st carries the monthly figure minus the other days
+            # of the month, which replaces the daily read of the 1st if any.
+            others = [
+                read
+                for read in daily_from
+                if _month_of(read) == first_month and read.date != transition.date
+            ]
+            daily_from = [read for read in daily_from if read.date != transition.date]
+            daily_from.insert(0, _subtract(transition, others))
+        self._import_reads(specs, before + daily_from, sums)
 
     async def _insert_monthly_statistics(
         self, specs: tuple[StatisticSpec, ...], house: str, last_stat_ts: float | None
@@ -291,21 +385,28 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         _LOGGER.debug("No daily data, importing monthly data since %s", start.strftime("%Y-%m"))
 
         usage_reads = await self.api.async_get_monthly_usage(house, start, now)
+        self._import_reads(
+            specs,
+            [read for read in usage_reads if read.date.replace(tzinfo=None) >= start],
+            sums,
+        )
 
-        statistics: dict[str, list[StatisticData]] = {
-            statistic_id: [] for statistic_id in statistic_ids
-        }
+    def _import_reads(
+        self,
+        specs: tuple[StatisticSpec, ...],
+        usage_reads: list[DailyUsageRead],
+        sums: dict[str, float],
+    ) -> None:
+        """Add `usage_reads` (in date order) on top of the running `sums`."""
+        statistics: dict[str, list[StatisticData]] = {spec.statistic_id: [] for spec in specs}
         for usage_read in usage_reads:
-            if usage_read.date.replace(tzinfo=None) < start:
-                continue
-            _LOGGER.debug("Importing data for %s...", usage_read.date.strftime("%Y-%m"))
+            _LOGGER.debug("Importing data for %s...", usage_read.date.strftime("%Y-%m-%d"))
             for spec in specs:
                 value = spec.value_fn(usage_read)
                 sums[spec.statistic_id] += value
                 statistics[spec.statistic_id].append(
                     StatisticData(start=usage_read.date, state=value, sum=sums[spec.statistic_id])
                 )
-
         self._add_statistics(specs, statistics)
 
     async def _async_get_sums_before(
