@@ -202,7 +202,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
 
         cost_metadata = StatisticMetaData(
             mean_type=StatisticMeanType.NONE,
-            unit_class="monetary",
+            unit_class=None,  # HA has no monetary unit class
             has_sum=True,
             name=f"{name_prefix} cost",
             source=DOMAIN,

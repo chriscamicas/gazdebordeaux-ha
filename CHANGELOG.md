@@ -5,7 +5,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.1.11] - 2026-04-28
-- Tag the cost statistic with `unit_class="monetary"` so the energy dashboard recognizes it as a currency series (was `None` before)
+- Import the cost statistic with `unit_class=None`: Home Assistant has no `"monetary"` unit class and rejected the whole import with "Unsupported unit_class: 'monetary'" (#47)
 - Drop deprecated `device_class` / `state_class` / `has_mean` keys from external statistic metadata; they're no longer accepted by the recorder's `StatisticMetaData` TypedDict in modern Home Assistant
 - Refactor `GdbEntityDescription` to the modern frozen+kw_only single-dataclass pattern (the old mixin shape doesn't compose with the now-frozen `EntityDescription`)
 
