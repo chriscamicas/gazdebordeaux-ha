@@ -30,15 +30,33 @@ The `selectedHouse` value comes back in two shapes depending on the account:
 
 `async_get_data` normalizes both before formatting `DATA_URL` (keep that normalization if you refactor).
 
-### Multi-contract accounts
+### Multi-contract accounts and `selectedHouse`
 
-Accounts holding multiple contracts (e.g. gas + electricity) come back from `/users/me` with `selectedHouse: null` and a `houses` array of plain string paths:
+`/users/me` returns every contract in `houses` (plain string paths) plus a `selectedHouse`:
 
 ```json
-{ "selectedHouse": null, "houses": ["/api/houses/uuid1", "/api/houses/uuid2"] }
+{ "selectedHouse": "/api/houses/uuid1", "houses": ["/api/houses/uuid1", "/api/houses/uuid2"] }
 ```
 
-`loadHouse()` iterates these, GETs each, and picks the first whose `contractType.category == "gas"`. If none match it raises with the `(path, category)` list — that surface is intentional, treat it as a real error rather than papering over.
+**`selectedHouse` is just the contract last picked in the web UI.** The SPA switches it with `PUT /api/houses/{uuid}` `{"selected": true|false}`, and it can be `null`. Never use it to decide what to import, and never PUT houses from the integration: that would change what the user sees on the website.
+
+`async_list_houses()` GETs every path in `houses` and returns `House` objects carrying `contractType.category` (`"gas"` / `"electricity"`), `name`, `contractType.label` and the address, which the flows use for the dropdown labels. `async_find_house(category)` resolves the `auto` sentinel left by the v1→v2 migration. When nothing matches it raises with the `(path, category)` list. That surface is intentional, so treat it as a real error rather than papering over it.
+
+### Electricity payload
+
+Electricity `/consumptions` responses have the same shape as gas (`kwh`, `price`, `volumeOfEnergy`, `ratio`, `temperature`, …) with `volumeOfEnergy`/`ratio` at 0. Days or months without data may only carry a subset of keys, so read the optional ones with `.get()`. Some electricity contracts expose **no daily data at all**: `scale=month|week|day` return every day with `kwh: 0` (the website's own day/week charts are empty too), while `scale=year` with `startDate`/`endDate` returns real per-month figures keyed `YYYY-MM`. The coordinator detects this (daily history all zero) and imports monthly points instead (`_insert_monthly_statistics`), rewriting from the month before the last imported one on top of the running sum just before it. Recent zero days alone never trigger the fallback, because gas can legitimately have zero days.
+
+A contract can switch to daily data later, once the customer turns on daily reporting on the website. Daily history then starts on that day; it isn't backfilled. Observed in November 2026: zero every day through 4 Oct, real days from 5 Oct, and 1–4 Oct only present in October's `scale=year` figure. `_insert_full_history` handles that by importing monthly points for the months before the first day with data. It then adds a point on the 1st of that month holding the monthly figure minus the month's daily reads, followed by the daily reads, so totals match the website's. When an existing series is monthly (`_is_monthly_series`: the two newest points are a month apart, on the 1st) and daily data shows up, the series is cleared and rebuilt with `_insert_full_history`.
+
+Note that `DailyUsageRead.date` uses `.replace(tzinfo=paris_tz)` (pytz LMT, +00:09). Existing gas statistics are stored with that offset, so don't "fix" it to `localize()` without migrating them.
+
+### Config entry shape (version 2)
+
+`username`, `password`, `reset_stats`, `gas_house`, `electricity_house`. Each house value is a normalized `/api/houses/{uuid}` path, `"none"`, or (gas only, from migration) `"auto"`. The house selectors are `vol.Required` with an explicit `"none"` option, which sidesteps the Optional-default pitfall below.
+
+### Statistic IDs
+
+Gas keeps its pre-1.2 IDs (`gazdebordeaux:energy_consumption`, `:energy_cost`, `:volume`) so that history survives. Electricity uses `gazdebordeaux:electricity_consumption` and `:electricity_cost`. Both are declared in `ENERGY_STATISTICS` in `coordinator.py`. Cost statistics need `unit_class=None`: the recorder rejects any unit class without a unit converter, and `"monetary"` has none.
 
 ### Login response on bad credentials vs. blocked request
 
@@ -61,13 +79,7 @@ The coordinator runs every 12h but the JWT expires sooner, so `_async_update_dat
 
 ## Local testing
 
-`test_login.py` at the repo root drives `Gazdebordeaux` directly without any `homeassistant` import. Use it to repro API issues fast:
-
-```bash
-GDB_USERNAME=you@example.com GDB_PASSWORD='...' python test_login.py
-```
-
-Logging defaults to DEBUG in that script so you'll see request URLs, response status, content-type, and body for every call.
+There is no committed repro script any more. To hit the real API fast, write a throwaway script that puts `custom_components/gazdebordeaux` on `sys.path` and imports `gazdebordeaux` directly. That module has no `homeassistant` import, only `aiohttp` and `pytz`. Then drive `Gazdebordeaux(session, username, password)` with DEBUG logging, which shows request URLs, response status, content-type and body for every call.
 
 ## Versioning / changelog convention
 

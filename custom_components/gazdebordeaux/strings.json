@@ -6,7 +6,23 @@
                     "username": "[%key:common::config_flow::data::username%]",
                     "password": "[%key:common::config_flow::data::password%]"
                 }
+            },
+            "contracts": {
+                "title": "Contrats",
+                "description": "Choisissez les contrats à suivre dans le tableau de bord Énergie",
+                "data": {
+                    "gas_house": "Contrat gaz",
+                    "electricity_house": "Contrat électricité"
+                }
             }
+        },
+        "error": {
+            "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+            "no_contract_selected": "Sélectionnez au moins un contrat"
+        },
+        "abort": {
+            "already_configured": "[%key:common::config_flow::abort::already_configured_account%]",
+            "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
         }
     },
     "options": {
@@ -17,9 +33,18 @@
                 "data": {
                     "username": "[%key:common::config_flow::data::username%]",
                     "password": "[%key:common::config_flow::data::password%]",
-                    "reset_stats": "Efface tout l'historique de statistiques"
+                    "reset_stats": "Efface tout l'historique de statistiques",
+                    "gas_house": "Contrat gaz",
+                    "electricity_house": "Contrat électricité"
                 }
             }
+        },
+        "error": {
+            "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+            "no_contract_selected": "Sélectionnez au moins un contrat"
+        },
+        "abort": {
+            "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
         }
     }
 }

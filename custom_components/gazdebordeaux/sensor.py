@@ -17,7 +17,7 @@ from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import DOMAIN, ENERGY_ELECTRICITY, ENERGY_GAS
 from .coordinator import GdbCoordinator
 from .gazdebordeaux import TotalUsageRead
 
@@ -29,6 +29,7 @@ from .gazdebordeaux import TotalUsageRead
 class GdbEntityDescription(SensorEntityDescription):  # type: ignore[override]
     """Class describing Gaz de Bordeaux sensor entities."""
 
+    energy: str
     value_fn: Callable[[TotalUsageRead], str | float]
 
 
@@ -45,6 +46,7 @@ GAS_SENSORS: tuple[GdbEntityDescription, ...] = (
         suggested_unit_of_measurement=UnitOfVolume.CUBIC_METERS,
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=0,
+        energy=ENERGY_GAS,
         value_fn=lambda data: data.volumeOfEnergy,
     ),
     GdbEntityDescription(
@@ -55,6 +57,7 @@ GAS_SENSORS: tuple[GdbEntityDescription, ...] = (
         suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=0,
+        energy=ENERGY_GAS,
         value_fn=lambda data: data.amountOfEnergy,
     ),
     GdbEntityDescription(
@@ -64,6 +67,31 @@ GAS_SENSORS: tuple[GdbEntityDescription, ...] = (
         native_unit_of_measurement="€",
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=0,
+        energy=ENERGY_GAS,
+        value_fn=lambda data: data.price,
+    ),
+)
+
+ELECTRICITY_SENSORS: tuple[GdbEntityDescription, ...] = (
+    GdbEntityDescription(
+        key="electricity_energy_to_date",
+        name="Current electricity usage to date",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        suggested_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL,
+        suggested_display_precision=0,
+        energy=ENERGY_ELECTRICITY,
+        value_fn=lambda data: data.amountOfEnergy,
+    ),
+    GdbEntityDescription(
+        key="electricity_cost_to_date",
+        name="Current bill electricity cost to date",
+        device_class=SensorDeviceClass.MONETARY,
+        native_unit_of_measurement="€",
+        state_class=SensorStateClass.TOTAL,
+        suggested_display_precision=0,
+        energy=ENERGY_ELECTRICITY,
         value_fn=lambda data: data.price,
     ),
 )
@@ -77,25 +105,44 @@ async def async_setup_entry(
     coordinator: GdbCoordinator = hass.data[DOMAIN][entry.entry_id]
     entities: list[GdbSensor | GdbLastUpdateSensor] = []
 
-    device_id = "gazpar"
-    device = DeviceInfo(
-        identifiers={(DOMAIN, device_id)},
+    gas_device = DeviceInfo(
+        identifiers={(DOMAIN, "gazpar")},
         name="Gaz de Bordeaux",
         manufacturer="Regaz",
         model="gazpar",
         entry_type=DeviceEntryType.SERVICE,
     )
-    sensors: tuple[GdbEntityDescription, ...] = GAS_SENSORS
-    for sensor in sensors:
-        entities.append(
-            GdbSensor(
-                coordinator,
-                sensor,
-                "",
-                device,
-                device_id,
+    electricity_device = DeviceInfo(
+        identifiers={(DOMAIN, "linky")},
+        name="Gaz de Bordeaux Électricité",
+        manufacturer="Gaz de Bordeaux",
+        model="linky",
+        entry_type=DeviceEntryType.SERVICE,
+    )
+    per_energy: tuple[tuple[str, tuple[GdbEntityDescription, ...], DeviceInfo, str], ...] = (
+        (ENERGY_GAS, GAS_SENSORS, gas_device, "gazpar"),
+        (ENERGY_ELECTRICITY, ELECTRICITY_SENSORS, electricity_device, "linky"),
+    )
+    for energy, sensors, device, device_id in per_energy:
+        if energy not in coordinator.houses:
+            continue
+        for sensor in sensors:
+            entities.append(
+                GdbSensor(
+                    coordinator,
+                    sensor,
+                    "",
+                    device,
+                    device_id,
+                )
             )
-        )
+
+    # The last update sensor stays on the gas device (historical unique id).
+    device, device_id = (
+        (gas_device, "gazpar")
+        if ENERGY_GAS in coordinator.houses
+        else (electricity_device, "linky")
+    )
 
     # Ajout du sensor de dernière actualisation
     entities.append(GdbLastUpdateSensor(coordinator, device, device_id))
@@ -126,9 +173,12 @@ class GdbSensor(CoordinatorEntity[GdbCoordinator], SensorEntity):
     @property
     def native_value(self) -> StateType:
         """Return the state."""
-        if self.coordinator.data is not None:
-            return self.entity_description.value_fn(self.coordinator.data)
-        return None
+        if self.coordinator.data is None:
+            return None
+        data = self.coordinator.data.get(self.entity_description.energy)
+        if data is None:
+            return None
+        return self.entity_description.value_fn(data)
 
 
 # Nouveau sensor de dernière actualisation
