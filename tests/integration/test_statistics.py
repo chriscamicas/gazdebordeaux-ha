@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
@@ -12,6 +13,7 @@ from homeassistant.components.recorder.statistics import (
     list_statistic_ids,
     statistics_during_period,
 )
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -27,7 +29,7 @@ from custom_components.gazdebordeaux.const import (
     RESET_STATISTICS,
 )
 from custom_components.gazdebordeaux.coordinator import ENERGY_STATISTICS, GdbCoordinator
-from custom_components.gazdebordeaux.gazdebordeaux import DailyUsageRead
+from custom_components.gazdebordeaux.gazdebordeaux import DailyUsageRead, TotalUsageRead
 
 ELEC = "/api/houses/elec-uuid"
 GAS = "/api/houses/gas-uuid"
@@ -530,3 +532,64 @@ async def test_reset_on_an_empty_database_runs_once(hass: HomeAssistant) -> None
     # The second update asks from the last imported day, not the whole history
     start = daily.await_args.args[1]
     assert (start.month, start.day) == (9, 2)
+
+
+async def test_setup_does_not_wait_for_the_statistics_import(hass: HomeAssistant) -> None:
+    # A rebuild can take a while; Home Assistant cancels a setup that long,
+    # so the import runs in the background
+    entry = _gas_entry(hass)
+    release = asyncio.Event()
+    imported = []
+
+    async def slow_import(self: GdbCoordinator, energy: str, house: str) -> None:
+        # Bounded, so that an import holding the setup fails the test instead of hanging it
+        await asyncio.wait_for(release.wait(), 5)
+        imported.append(energy)
+
+    total = TotalUsageRead(amountOfEnergy=1.0, volumeOfEnergy=0.0, price=1.0)
+    with (
+        patch(f"{API}.async_login", new=AsyncMock(return_value=None)),
+        patch(f"{API}.async_get_total_usage", new=AsyncMock(return_value=total)),
+        patch.object(GdbCoordinator, "_insert_statistics", new=slow_import),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        assert entry.state is ConfigEntryState.LOADED
+        assert not imported
+
+        release.set()
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert imported == ["gas"]
+
+
+async def test_failed_import_keeps_the_totals_and_the_other_energy(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        data={
+            CONF_USERNAME: "user@example.com",
+            CONF_PASSWORD: "secret",
+            CONF_GAS_HOUSE: GAS,
+            CONF_ELECTRICITY_HOUSE: ELEC,
+        },
+    )
+    entry.add_to_hass(hass)
+    coordinator = GdbCoordinator(hass, entry)
+    imported = []
+
+    async def import_or_fail(self: GdbCoordinator, energy: str, house: str) -> None:
+        if energy == "gas":
+            raise Exception("Data response was not JSON (status=403)")
+        imported.append(energy)
+
+    total = TotalUsageRead(amountOfEnergy=1.0, volumeOfEnergy=0.0, price=1.0)
+    with (
+        patch(f"{API}.async_login", new=AsyncMock(return_value=None)),
+        patch(f"{API}.async_get_total_usage", new=AsyncMock(return_value=total)),
+        patch.object(GdbCoordinator, "_insert_statistics", new=import_or_fail),
+    ):
+        data = await coordinator._async_update_data()
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert set(data) == {"gas", "electricity"}
+    assert imported == ["electricity"]

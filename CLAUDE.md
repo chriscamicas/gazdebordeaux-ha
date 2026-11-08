@@ -77,6 +77,10 @@ Voluptuous applies `default=` whenever the key is absent from input. HA's fronte
 
 The coordinator runs every 12h but the JWT expires sooner, so `_async_update_data` calls `async_login()` on every refresh. Don't add caching that skips that re-login or you'll start chasing intermittent 401s.
 
+### Statistics import runs in the background
+
+`_async_update_data` fetches the totals for the sensors, starts `_async_insert_statistics_logged` as a background task (one at a time) and returns. A failure on one energy is logged and retried at the next update, without stopping the other one. Tests that drive `_async_update_data` must wait with `hass.async_block_till_done(wait_background_tasks=True)`.
+
 ## Local testing
 
 There is no committed repro script any more. To hit the real API fast, write a throwaway script that puts `custom_components/gazdebordeaux` on `sys.path` and imports `gazdebordeaux` directly. That module has no `homeassistant` import, only `aiohttp` and `pytz`. Then drive `Gazdebordeaux(session, username, password)` with DEBUG logging, which shows request URLs, response status, content-type and body for every call.

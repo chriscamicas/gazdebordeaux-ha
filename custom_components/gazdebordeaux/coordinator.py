@@ -1,5 +1,6 @@
 """Coordinator to handle Opower connections."""
 
+import asyncio
 import dataclasses
 import logging
 from collections.abc import Callable
@@ -181,6 +182,8 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
 
         # Initialisation de la date de dernière actualisation
         self.last_update: datetime | None = None
+        # Statistics import running in the background, see _async_update_data
+        self._statistics_task: asyncio.Task | None = None
 
         entry_data = entry.data
 
@@ -233,19 +236,32 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         for energy in self.houses:
             if self.houses[energy] == AUTO:
                 self.houses[energy] = await self.api.async_find_house(energy)
-            house = self.houses[energy]
+            data[energy] = await self.api.async_get_total_usage(self.houses[energy])
 
-            data[energy] = await self.api.async_get_total_usage(house)
-
-            # Because Opower provides historical usage/cost with a delay of a couple of days
-            # we need to insert data into statistics.
-            await self._insert_statistics(energy, house)
+        # Because Opower provides historical usage/cost with a delay of a couple of days
+        # we need to insert data into statistics. That runs in the background,
+        # so that a slow or failing import (a rebuild, Life's edge filter)
+        # holds neither the config entry setup, which Home Assistant cancels
+        # after a while, nor the sensors.
+        if self._statistics_task is None or self._statistics_task.done():
+            self._statistics_task = self.hass.async_create_background_task(
+                self._async_insert_statistics_logged(dict(self.houses)),
+                "gazdebordeaux statistics import",
+            )
 
         # Mise à jour de la date de dernière actualisation
         self.last_update = datetime.now()
         _LOGGER.debug("Last update: %s", self.last_update.strftime("%Y-%m-%d %H:%M:%S"))
 
         return data
+
+    async def _async_insert_statistics_logged(self, houses: dict[str, str]) -> None:
+        """Insert the statistics of each energy, logging failures; the next update retries."""
+        for energy, house in houses.items():
+            try:
+                await self._insert_statistics(energy, house)
+            except Exception:
+                _LOGGER.exception("Importing the Gaz de Bordeaux %s statistics failed", energy)
 
     async def _insert_statistics(self, energy: str, house: str) -> None:
         """Insert gdb statistics for one energy type."""

@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.3.0]
 - Date the daily and monthly reads at midnight Paris time instead of Paris mean time, which put every point at hh:51; existing statistics are moved to the whole hour once, in place, so no history is lost
 - Make the "reset statistics" option import the statistics again (it only logged a message). Like the rebuild when daily data appears, it downloads everything before clearing anything, so a failed download leaves the statistics as they were, and it starts from the oldest existing point rather than January 1st of last year, so older history is asked again instead of dropped
+- Import the statistics in the background, one import at a time: a slow or failing import (a rebuild, Life's edge filter) no longer holds the setup or makes the sensors unavailable, and a failure on one energy no longer stops the other one's import. Failures are logged and retried at the next update
 
 ## [1.2.0] - 2026-11-07
 - Add electricity consumption tracking: an electricity contract is imported into the `gazdebordeaux:electricity_consumption` and `gazdebordeaux:electricity_cost` statistics (Energy dashboard → Electricity grid consumption), with matching sensors on a new "Gaz de Bordeaux Électricité" device
