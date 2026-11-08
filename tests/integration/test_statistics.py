@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -22,6 +23,7 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
     async_wait_recording_done,
 )
 
+from custom_components.gazdebordeaux import coordinator as coordinator_module
 from custom_components.gazdebordeaux.const import (
     CONF_ELECTRICITY_HOUSE,
     CONF_GAS_HOUSE,
@@ -30,12 +32,28 @@ from custom_components.gazdebordeaux.const import (
     RESET_STATISTICS,
 )
 from custom_components.gazdebordeaux.coordinator import ENERGY_STATISTICS, GdbCoordinator
-from custom_components.gazdebordeaux.gazdebordeaux import DailyUsageRead, TotalUsageRead
+from custom_components.gazdebordeaux.gazdebordeaux import (
+    DailyUsageRead,
+    Gazdebordeaux,
+    HouseDetails,
+    TotalUsageRead,
+)
 
 ELEC = "/api/houses/elec-uuid"
 GAS = "/api/houses/gas-uuid"
 API = "custom_components.gazdebordeaux.coordinator.Gazdebordeaux"
 PARIS = pytz.timezone("Europe/Paris")
+
+
+@pytest.fixture(autouse=True)
+def _house_without_curve(monkeypatch):
+    """No load curve unless a test says otherwise, and no pause between hours."""
+    monkeypatch.setattr(
+        Gazdebordeaux,
+        "async_get_house_details",
+        AsyncMock(return_value=HouseDetails(hourly_start=None)),
+    )
+    monkeypatch.setattr(coordinator_module, "HOURLY_REQUEST_DELAY", 0)
 
 
 def _read(day: int, kwh: float, price: float) -> DailyUsageRead:
@@ -110,6 +128,7 @@ def _month(year: int, month: int, kwh: float, price: float) -> DailyUsageRead:
         price=price,
         ratio=0,
         temperature=20,
+        monthly=True,
     )
 
 
@@ -652,3 +671,329 @@ async def test_daily_sums_whatever_the_process_time_zone(
 
     rows = await _hourly_rows(hass, f"{DOMAIN}:electricity_consumption")
     assert [(r["state"], r["sum"]) for r in rows] == [(10, 10), (5, 15), (7, 22)]
+
+
+# ---------- hour by hour, from the load curve ------------------------------
+
+DAY_PRICE = 2.4
+CONSUMPTION = f"{DOMAIN}:electricity_consumption"
+COST = f"{DOMAIN}:electricity_cost"
+
+
+class FakeApi(Gazdebordeaux):
+    """Serve synthetic Life responses to the real parsing code."""
+
+    def __init__(self, hourly_start: date | None) -> None:
+        super().__init__(None, "user@example.com", "secret", token="token")  # type: ignore[arg-type]
+        self.today = datetime.now(PARIS).date()
+        self.last_day = self.today - timedelta(days=2)
+        self.hourly_start = hourly_start
+        self.fail_hourly = False
+        self.hourly_days: list[date] = []
+        # Last day with a load curve; later days answer without points
+        self.hourly_until = self.last_day
+
+    async def async_login(self) -> None:
+        return None
+
+    async def async_get_house_details(self, house: str) -> HouseDetails:
+        return HouseDetails(hourly_start=self.hourly_start)
+
+    def daily_payload(self, day: date) -> dict[str, Any]:
+        return {"kwh": 12.0, "price": DAY_PRICE, "volumeOfEnergy": 0, "ratio": 0}
+
+    async def async_get_data(self, house: str, start: Any, end: Any, scale: str) -> Any:
+        if scale == "year":
+            return {"total": {"kwh": 1.0, "price": 1.0}}
+        if scale == "month":
+            day = start.date()
+            data: dict[str, Any] = {"total": {}}
+            while day <= min(end.date(), self.last_day):
+                data[day.isoformat()] = self.daily_payload(day)
+                day += timedelta(days=1)
+            return data
+        assert scale == "day"
+        day = start.date()
+        self.hourly_days.append(day)
+        if self.fail_hourly:
+            raise Exception("Data response was not JSON (status=403)")
+        if day > min(self.last_day, self.hourly_until):
+            return {"total": {}}
+        midnight = datetime(day.year, day.month, day.day)
+        return {
+            (midnight + timedelta(minutes=30 * i)).strftime("%Y-%m-%d %H:%M:%S"): {
+                "kwh": 0.5,
+                "price": 0,
+                "volumeOfEnergy": 0,
+            }
+            for i in range(49)
+        }
+
+
+def _fake_coordinator(hass: HomeAssistant, api: FakeApi) -> GdbCoordinator:
+    coordinator = GdbCoordinator(hass, _electricity_entry(hass))
+    coordinator.api = api
+    return coordinator
+
+
+async def _all_rows(hass: HomeAssistant, statistic_id: str) -> list[dict]:
+    await async_wait_recording_done(hass)
+    return await _hourly_rows(hass, statistic_id, datetime(2000, 1, 1))
+
+
+def _days(rows: list[dict]) -> dict[date, list[dict]]:
+    by_day: dict[date, list[dict]] = {}
+    for row in rows:
+        by_day.setdefault(datetime.fromtimestamp(row["start"], PARIS).date(), []).append(row)
+    return by_day
+
+
+def _hours_in(day: date) -> int:
+    """23, 24 or 25: the clock changes fall in any ten-day window."""
+    start = PARIS.localize(datetime(day.year, day.month, day.day))
+    end = PARIS.localize(datetime.combine(day + timedelta(days=1), datetime.min.time()))
+    return round((end - start).total_seconds() / 3600)
+
+
+def _day_count(api: FakeApi) -> int:
+    return (api.last_day - date(api.today.year - 1, 1, 1)).days + 1
+
+
+async def test_first_import_hourly_since_curve_start(hass: HomeAssistant) -> None:
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=10))
+    await _fake_coordinator(hass, api)._insert_statistics("electricity", ELEC)
+
+    days = _days(await _all_rows(hass, CONSUMPTION))
+    hourly_days = sorted(d for d, r in days.items() if len(r) > 1)
+    assert hourly_days[0] == api.hourly_start
+    assert hourly_days[-1] == api.last_day
+    assert all(len(days[d]) == _hours_in(d) for d in hourly_days)
+    assert all(len(r) == 1 for d, r in days.items() if d < api.hourly_start)
+    consumption = await _all_rows(hass, CONSUMPTION)
+    assert consumption[-1]["sum"] == pytest.approx(12.0 * _day_count(api))
+    cost = await _all_rows(hass, COST)
+    assert cost[-1]["sum"] == pytest.approx(DAY_PRICE * _day_count(api))
+    # The hours carry no cost: the day's is spread by consumption
+    noon = next(r for r in _days(cost)[api.last_day] if r["start"] % 3600 == 0)
+    assert noon["state"] == pytest.approx(DAY_PRICE * 0.5 / 12.0)
+
+
+async def test_curve_older_than_life_keeps_starts_at_the_limit(
+    hass: HomeAssistant, monkeypatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "HOURLY_MAX_DAYS", 5)
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=10))
+    await _fake_coordinator(hass, api)._insert_statistics("electricity", ELEC)
+
+    assert min(api.hourly_days) == api.today - timedelta(days=5)
+
+
+async def test_second_update_adds_nothing_twice(hass: HomeAssistant) -> None:
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=5))
+    coordinator = _fake_coordinator(hass, api)
+    await coordinator._insert_statistics("electricity", ELEC)
+    before = await _all_rows(hass, CONSUMPTION)
+    await coordinator._insert_statistics("electricity", ELEC)
+    after = await _all_rows(hass, CONSUMPTION)
+
+    assert len(after) == len(before)
+    assert after[-1]["sum"] == pytest.approx(before[-1]["sum"])
+
+
+async def test_next_days_come_in_hour_by_hour(hass: HomeAssistant) -> None:
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=8))
+    api.last_day -= timedelta(days=3)
+    coordinator = _fake_coordinator(hass, api)
+    await coordinator._insert_statistics("electricity", ELEC)
+    await async_wait_recording_done(hass)
+
+    api.last_day += timedelta(days=3)
+    api.hourly_until = api.last_day
+    await coordinator._insert_statistics("electricity", ELEC)
+    rows = await _all_rows(hass, CONSUMPTION)
+
+    assert rows[-1]["sum"] == pytest.approx(12.0 * _day_count(api))
+    days = _days(rows)
+    for day in (api.last_day - timedelta(days=d) for d in range(3)):
+        assert len(days[day]) == _hours_in(day)
+
+
+async def test_failed_hourly_rebuild_keeps_the_statistics(hass: HomeAssistant) -> None:
+    entry = _electricity_entry(hass)
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=5))
+    first = GdbCoordinator(hass, entry)
+    first.api = api
+    await first._insert_statistics("electricity", ELEC)
+    before = await _all_rows(hass, CONSUMPTION)
+
+    coordinator = _reset_coordinator(hass, entry)
+    coordinator.api = api
+    api.fail_hourly = True
+    with pytest.raises(Exception, match="not JSON"):
+        await coordinator._insert_statistics("electricity", ELEC)
+    after = await _all_rows(hass, CONSUMPTION)
+
+    assert len(after) == len(before)
+    assert after[-1]["sum"] == pytest.approx(before[-1]["sum"])
+    assert coordinator._reset_pending == {"electricity"}
+
+
+@pytest.mark.parametrize("process_tz", ["UTC", "Asia/Tokyo"])
+async def test_day_boundaries_ignore_the_process_time_zone(
+    hass: HomeAssistant, monkeypatch, process_tz: str
+) -> None:
+    # East of Paris, the last hour of a Paris day already falls on the next
+    # date: it must not hide the next day's read
+    monkeypatch.setenv("TZ", process_tz)
+    time.tzset()
+    try:
+        api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=10))
+        api.hourly_until = date(2000, 1, 1)  # curve not published yet: daily reads
+        coordinator = _fake_coordinator(hass, api)
+        await coordinator._insert_statistics("electricity", ELEC)
+        first = await _all_rows(hass, CONSUMPTION)
+        assert all(len(r) == 1 for r in _days(first).values())
+        # Recent days wait for their hours rather than going in daily
+        waiting = api.last_day
+        assert waiting not in _days(first)
+
+        api.hourly_until = date(3000, 1, 1)  # the curve shows up
+        await coordinator._insert_statistics("electricity", ELEC)
+        await async_wait_recording_done(hass)
+        api.last_day += timedelta(days=1)  # and one more day is published
+        await coordinator._insert_statistics("electricity", ELEC)
+        rows = await _all_rows(hass, CONSUMPTION)
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+    assert rows[-1]["sum"] == pytest.approx(12.0 * _day_count(api))
+    days = _days(rows)
+    assert len(days[waiting]) == _hours_in(waiting)
+    assert len(days[api.last_day]) == _hours_in(api.last_day)
+    for day, day_rows in days.items():
+        assert sum(r["state"] for r in day_rows) == pytest.approx(12.0), day
+
+
+async def test_hours_that_miss_the_daily_read_keep_it(hass: HomeAssistant) -> None:
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=6))
+    short_day = api.last_day - timedelta(days=1)
+    curve = api.async_get_data
+
+    async def with_a_short_day(house: str, start: Any, end: Any, scale: str) -> Any:
+        data = await curve(house, start, end, scale)
+        if scale == "day" and start.date() == short_day:
+            # Half the day's energy: a curve with holes, not the day itself
+            data = {k: {**v, "kwh": 0.25} if k != "total" else v for k, v in data.items()}
+        return data
+
+    api.async_get_data = with_a_short_day  # type: ignore[method-assign]
+    await _fake_coordinator(hass, api)._insert_statistics("electricity", ELEC)
+    days = _days(await _all_rows(hass, CONSUMPTION))
+
+    assert len(days[short_day]) == 1
+    assert days[short_day][0]["state"] == pytest.approx(12.0)
+    assert len(days[api.last_day]) == _hours_in(api.last_day)
+
+
+async def test_a_day_without_consumption_keeps_its_cost(hass: HomeAssistant) -> None:
+    # A 0 kWh day still costs its subscription: spread evenly over its hours
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=6))
+    empty = api.last_day - timedelta(days=1)
+    payload, curve = api.daily_payload, api.async_get_data
+
+    def daily_payload(day: date) -> dict[str, Any]:
+        return {**payload(day), "kwh": 0.0, "price": 0.52} if day == empty else payload(day)
+
+    async def with_an_empty_day(house: str, start: Any, end: Any, scale: str) -> Any:
+        data = await curve(house, start, end, scale)
+        if scale == "day" and start.date() == empty:
+            data = {k: {**v, "kwh": 0.0} if k != "total" else v for k, v in data.items()}
+        return data
+
+    api.daily_payload = daily_payload  # type: ignore[method-assign]
+    api.async_get_data = with_an_empty_day  # type: ignore[method-assign]
+    await _fake_coordinator(hass, api)._insert_statistics("electricity", ELEC)
+    hours = _days(await _all_rows(hass, COST))[empty]
+
+    assert len(hours) == _hours_in(empty)
+    assert sum(r["state"] for r in hours) == pytest.approx(0.52)
+
+
+async def test_gas_volume_is_spread_over_the_hours(hass: HomeAssistant) -> None:
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=3))
+    api.daily_payload = lambda day: {  # type: ignore[method-assign]
+        "kwh": 12.0,
+        "price": DAY_PRICE,
+        "volumeOfEnergy": 1.2,
+    }
+    coordinator = GdbCoordinator(hass, _gas_entry(hass))
+    coordinator.api = api
+    await coordinator._insert_statistics("gas", GAS)
+    days = _days(await _all_rows(hass, f"{DOMAIN}:volume"))
+
+    assert len(days[api.last_day]) == _hours_in(api.last_day)
+    assert sum(r["state"] for r in days[api.last_day]) == pytest.approx(1.2)
+
+
+async def test_account_without_load_curve_stays_daily(hass: HomeAssistant) -> None:
+    # Gas, or electricity without half-hourly readings: no hourly request,
+    # and the latest daily reads come in at once, as before
+    api = FakeApi(hourly_start=None)
+    await _fake_coordinator(hass, api)._insert_statistics("electricity", ELEC)
+    days = _days(await _all_rows(hass, CONSUMPTION))
+
+    assert api.hourly_days == []
+    assert all(len(r) == 1 for r in days.values())
+    assert max(days) == api.last_day
+
+
+async def test_house_details_failure_falls_back_to_daily(hass: HomeAssistant) -> None:
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=5))
+    api.async_get_house_details = AsyncMock(  # type: ignore[method-assign]
+        side_effect=Exception("Data response was not JSON (status=403)")
+    )
+    await _fake_coordinator(hass, api)._insert_statistics("electricity", ELEC)
+    days = _days(await _all_rows(hass, CONSUMPTION))
+
+    assert api.hourly_days == []
+    assert max(days) == api.last_day
+
+
+async def test_hours_follow_the_monthly_points(hass: HomeAssistant, monkeypatch) -> None:
+    """Monthly points and the 1st's remainder stay as they are; days go hourly."""
+    monkeypatch.setattr(coordinator_module, "HOURLY_MAX_DAYS", 100_000)
+    coordinator = GdbCoordinator(hass, _electricity_entry(hass))
+    asked = []
+
+    async def hours(self: Gazdebordeaux, house: str, day: date, daily_energy: float) -> list:
+        asked.append(day)
+        return [
+            DailyUsageRead(
+                date=PARIS.localize(datetime(day.year, day.month, day.day, hour)),
+                amountOfEnergy=daily_energy / 24,
+                volumeOfEnergy=0,
+                price=0,
+                ratio=0,
+                temperature=0,
+            )
+            for hour in range(24)
+        ]
+
+    with (
+        patch(f"{API}.async_get_daily_usage", new=AsyncMock(return_value=DAILY_SINCE_OCTOBER)),
+        patch(f"{API}.async_get_monthly_usage", new=AsyncMock(return_value=MONTHLY_SINCE_AUGUST)),
+        patch(
+            f"{API}.async_get_house_details",
+            new=AsyncMock(return_value=HouseDetails(hourly_start=date(2026, 10, 1))),
+        ),
+        patch(f"{API}.async_get_hourly_usage", new=hours),
+    ):
+        await coordinator._insert_statistics("electricity", ELEC)
+
+    assert asked == [date(2026, 10, 4), date(2026, 10, 5), date(2026, 10, 6), date(2026, 11, 1)]
+    rows = await _all_rows(hass, CONSUMPTION)
+    days = _days(rows)
+    assert [len(days[date(2026, m, 1)]) for m in (8, 9, 10)] == [1, 1, 1]
+    assert len(days[date(2026, 10, 5)]) == 24
+    assert rows[-1]["sum"] == pytest.approx(1151.5)

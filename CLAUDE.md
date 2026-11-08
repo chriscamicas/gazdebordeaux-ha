@@ -14,8 +14,8 @@ The API moved during this project's lifetime; the current host is `life.gazdebor
 
 - `POST /api/login_check` — JSON `{email, password}` → `{token}` (JWT, ~24h expiry).
 - `GET /api/users/me` — current user, includes `selectedHouse` and `houses[]`.
-- `GET /api/houses/{uuid}` — house resource with `contractType.category` (`"gas"`, `"electricity"`, …).
-- `GET /api{house_path}/consumptions?scale={year|month}[&startDate=&endDate=]` — consumption payload. `scale=year` returns a wrapper with a `total` key; `scale=month` returns a dict keyed by date plus a `total` entry.
+- `GET /api/houses/{uuid}` — house resource with `contractType.category` (`"gas"`, `"electricity"`, …) and, when the customer turned the load curve on, `hourlyMeasureStartDate`.
+- `GET /api{house_path}/consumptions?scale={year|month|day}[&startDate=&endDate=]` — consumption payload. `scale=year` returns a wrapper with a `total` key; `scale=month` returns a dict keyed by date plus a `total` entry; `scale=day` returns the load curve of one day (see below).
 
 ### Required browser-like headers
 
@@ -49,6 +49,12 @@ Electricity `/consumptions` responses have the same shape as gas (`kwh`, `price`
 A contract can switch to daily data later, once the customer turns on daily reporting on the website. Daily history then starts on that day; it isn't backfilled. Observed in November 2026: zero every day through 4 Oct, real days from 5 Oct, and 1–4 Oct only present in October's `scale=year` figure. `_insert_full_history` handles that by importing monthly points for the months before the first day with data. It then adds a point on the 1st of that month holding the monthly figure minus the month's daily reads, followed by the daily reads, so totals match the website's. When an existing series is monthly (`_is_monthly_series`: the two newest points are a month apart, on the 1st) and daily data shows up, the series is rebuilt with `_insert_full_history(..., rebuild=...)`. The "reset statistics" option goes through it too. A rebuild downloads everything before clearing the series, so a failed download leaves them untouched, and starts from the oldest existing point (`_async_get_first_day`), which can be older than the first import's range.
 
 `DailyUsageRead.date` uses `paris_tz.localize()`. pytz's `.replace(tzinfo=paris_tz)` picks Paris mean time (LMT, +00:09) and puts each point at hh:51 in Paris time, which is how statistics were stored before 1.3.0. When the newest point of a series is off the hour, `_move_to_whole_hours` moves every point of that energy's series to the whole hour, in place (same states and sums). Importing them again from Life instead would lose the days before the first import's range. `_is_first_of_month` accepts both offsets.
+
+### Load curve (hourly import)
+
+`scale=day&startDate=D&endDate=D` is what the website's day view asks: the Enedis load curve of day D, 49 points keyed by naive local time from `D 00:00:00` to `D+1 00:00:00`. Each point is the **average power in kW** over the half hour ending at its key. `async_get_hourly_usage` turns it into kW × 0.5 h at the start of that half hour (the `D 00:00` point belongs to the day before) and adds the half hours up by hour; the sum lands on the daily read within a few Wh. On the October change the day has 25 hours but still 49 points: the keys of the repeated 02:00–03:00 hour collide, and `_repeated_hour_halves` fills the two lost half hours from the daily read. The March change (47 points, 23 hours) loses nothing.
+
+The coordinator imports days hour by hour from `hourlyMeasureStartDate`, within the two years Life keeps (`HOURLY_MAX_DAYS`); without it, or when the house resource can't be read, everything stays daily. `_with_hourly_reads` never touches monthly points (`DailyUsageRead.monthly`), keeps a day's daily read when its hours are more than 10 % off, and stops at a recent day without hours (`HOURLY_GRACE_DAYS`) so that the next update picks it up hour by hour. Incremental updates start from the sums of the last points (`_async_get_last_sums`), not from a recorder day period, which follows Home Assistant's time zone.
 
 ### Config entry shape (version 2)
 

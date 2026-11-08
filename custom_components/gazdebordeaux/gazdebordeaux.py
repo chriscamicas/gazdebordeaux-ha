@@ -1,6 +1,6 @@
 import dataclasses
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from json.decoder import JSONDecodeError
 from typing import Any
 
@@ -13,6 +13,8 @@ ME_URL = "https://life.gazdebordeaux.fr/api/users/me"
 
 INPUT_DATE_FORMAT = "%Y-%m-%d"
 INPUT_MONTH_FORMAT = "%Y-%m"
+# Interval of the load curve returned by the "day" scale
+CURVE_STEP = timedelta(minutes=30)
 
 # Browser-like headers. The WAF on life.gazdebordeaux.fr rejects requests that
 # don't look like the SPA (same-origin fetch from the web app).
@@ -67,6 +69,16 @@ class DailyUsageRead:
     price: float
     ratio: float
     temperature: float
+    # A monthly figure (scale=year), dated on the 1st
+    monthly: bool = False
+
+
+@dataclasses.dataclass
+class HouseDetails:
+    """What the house resource tells about how its contract is metered."""
+
+    # First day of the half-hourly load curve, if the customer turned it on
+    hourly_start: date | None
 
 
 # ----------------------------------------------------------------------------
@@ -198,10 +210,97 @@ class Gazdebordeaux:
                     price=daily_data[d]["price"],
                     ratio=daily_data[d].get("ratio", 0),
                     temperature=daily_data[d].get("temperature", 0),
+                    monthly=date_format == INPUT_MONTH_FORMAT,
                 )
             )
 
         return usage_reads
+
+    async def async_get_house_details(self, house: str) -> HouseDetails:
+        """Return what the house resource tells about how its contract is metered."""
+        data = await self._fetch_house(_normalize_house_path(house))
+        if not isinstance(data, dict):
+            return HouseDetails(hourly_start=None)
+
+        hourly_start: date | None = None
+        start = data.get("hourlyMeasureStartDate")
+        if isinstance(start, str):
+            try:
+                hourly_start = date.fromisoformat(start[:10])
+            except ValueError:
+                Logger.warning("Unexpected hourlyMeasureStartDate %r", start)
+
+        details = HouseDetails(hourly_start=hourly_start)
+        Logger.debug("House details: %s", details)
+        return details
+
+    async def async_get_hourly_usage(
+        self, house: str, day: date, daily_energy: float | None = None
+    ) -> list[DailyUsageRead] | None:
+        """Return the hourly reads of one day, or None if none are available.
+
+        The "day" scale is what the Life web app uses for its day view: one
+        request per day. It returns the Enedis load curve: each point is the
+        average power in kW over the half hour ending at its key, from 00:00
+        of the day to 00:00 of the next one (49 points). Each point becomes
+        kW x 0.5 h at the start of its half hour; the first one belongs to
+        the day before and is dropped.
+
+        On the October change the day has 25 hours but the curve still has 49
+        points: the naive keys of the repeated 02:00-03:00 hour collide and
+        one of each pair is lost. With daily_energy, the two missing half
+        hours share what the curve lacks to reach the daily read.
+        """
+        start = datetime(day.year, day.month, day.day)
+        data = await self.async_get_data(house, start, start, "day")
+        Logger.debug("Hourly usage raw response for %s: %s", day, data)
+
+        if not isinstance(data, dict):
+            return None
+
+        halves: list[tuple[datetime, float, dict]] = []
+        previous: datetime | None = None
+        for key, value in data.items():
+            if key == "total" or not isinstance(value, dict):
+                continue
+            point = _parse_point_time(key, day, previous)
+            if point is None:
+                sample = {k: data[k] for k in list(data)[:2]}
+                Logger.warning(
+                    "Unexpected hourly key %r for %s, keeping the daily read. Sample: %s",
+                    key,
+                    day,
+                    sample,
+                )
+                return None
+            previous = point
+            point = paris_tz.normalize(point - CURVE_STEP)
+            if point.date() != day:
+                continue
+            halves.append((point, _energy(value) * CURVE_STEP.total_seconds() / 3600, value))
+
+        if daily_energy is not None:
+            halves.extend(_repeated_hour_halves(day, halves, daily_energy))
+
+        hours: dict[datetime, DailyUsageRead] = {}
+        for point, energy, value in sorted(halves, key=lambda h: h[0]):
+            hour = paris_tz.normalize(point.replace(minute=0))
+            read = hours.setdefault(
+                hour,
+                DailyUsageRead(
+                    date=hour,
+                    amountOfEnergy=0.0,
+                    volumeOfEnergy=0.0,
+                    price=0.0,
+                    ratio=0.0,
+                    temperature=0.0,
+                ),
+            )
+            read.amountOfEnergy += energy
+            read.volumeOfEnergy += value.get("volumeOfEnergy") or 0.0
+            read.price += _price(value)
+
+        return [hours[h] for h in sorted(hours)] or None
 
     async def async_get_data(
         self, house: str, start: datetime | None, end: datetime | None, scale: str
@@ -311,3 +410,89 @@ class Gazdebordeaux:
         Logger.debug("Fetching house %s", url)
         async with self._session.get(url, headers=self._authenticated_headers()) as response:
             return await response.json(content_type=None)
+
+
+# ----------------------------------------------------------------------------
+_POINT_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M",
+    "%H:%M:%S",
+    "%H:%M",
+)
+
+
+def _parse_point_time(key: str, day: date, previous: datetime | None = None) -> datetime | None:
+    """Turn a key of the "day" scale into an aware Paris datetime.
+
+    The format is not documented; accept the usual ones and reject a bare
+    date, which would mean the API answered with daily points.
+
+    Keys are local times in chronological order. On the October change the
+    02:00-03:00 hour comes twice: a time is read as summer time first, and as
+    winter time when that would not come after the previous point.
+    """
+    try:
+        parsed = datetime.fromisoformat(key)
+    except ValueError:
+        parsed = None
+    if parsed is not None and parsed.tzinfo is not None:
+        return parsed.astimezone(paris_tz)
+    if parsed is None or len(key) <= len("YYYY-MM-DD"):
+        parsed = None
+        for fmt in _POINT_FORMATS:
+            try:
+                parsed = datetime.strptime(key, fmt)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        return None
+    if parsed.year == 1900:
+        parsed = datetime.combine(day, parsed.time())
+    point = paris_tz.localize(parsed, is_dst=True)
+    if previous is not None and point <= previous:
+        point = paris_tz.localize(parsed, is_dst=False)
+    return point
+
+
+def _repeated_hour_halves(
+    day: date, halves: list[tuple[datetime, float, dict]], daily_energy: float
+) -> list[tuple[datetime, float, dict]]:
+    """Half hours of the repeated October hour that the curve lost.
+
+    They share what the curve lacks to reach the daily read. Only up to two
+    of them, all between 02:00 and 03:00, and none above the day's highest
+    half hour: anything else is a real gap, left to the daily read check.
+    """
+    midnight = paris_tz.localize(datetime(day.year, day.month, day.day))
+    next_day = day + timedelta(days=1)
+    end = paris_tz.localize(datetime(next_day.year, next_day.month, next_day.day))
+    if end - midnight <= timedelta(hours=24) or not halves:
+        return []
+    present = {point for point, _, _ in halves}
+    missing = []
+    point = midnight
+    while point < end:
+        if point not in present:
+            missing.append(paris_tz.normalize(point))
+        point += CURVE_STEP
+    if not missing or len(missing) > 2 or any(p.hour != 2 for p in missing):
+        return []
+    share = (daily_energy - sum(energy for _, energy, _ in halves)) / len(missing)
+    if share <= 0 or share > max(energy for _, energy, _ in halves):
+        return []
+    return [(p, share, {}) for p in missing]
+
+
+def _energy(value: dict) -> float:
+    if value.get("kwh") is not None:
+        return float(value["kwh"])
+    return float(value.get("consumptionHp") or 0.0) + float(value.get("consumptionHc") or 0.0)
+
+
+def _price(value: dict) -> float:
+    if value.get("price") is not None:
+        return float(value["price"])
+    return float(value.get("priceHp") or 0.0) + float(value.get("priceHc") or 0.0)
