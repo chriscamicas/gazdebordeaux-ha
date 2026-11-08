@@ -513,7 +513,7 @@ async def test_rebuild_reaches_back_to_the_oldest_point(hass: HomeAssistant) -> 
         await async_wait_recording_done(hass)
 
     start = daily.await_args.args[1]
-    assert (start.year, start.month) == (2023, 3)
+    assert start == datetime(2023, 3, 15)
     rows = await _hourly_rows(hass, f"{DOMAIN}:energy_consumption", datetime(2023, 1, 1))
     assert [r["sum"] for r in rows] == [10, 15]
 

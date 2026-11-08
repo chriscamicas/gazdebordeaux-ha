@@ -508,12 +508,13 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         self._add_statistics(tuple(spec for spec in specs if spec.statistic_id in moved), moved)
 
     async def _async_get_first_day(self, statistic_id: str) -> datetime | None:
-        """The start of the month holding the oldest point of `statistic_id`, if any.
+        """When the oldest point of `statistic_id` starts, if it has any.
 
         A rebuild imports again from there: the first import's range (since
         January 1st of last year) can start later than the existing history.
         """
-        stats = await get_instance(self.hass).async_add_executor_job(
+        instance = get_instance(self.hass)
+        months = await instance.async_add_executor_job(
             statistics_during_period,
             self.hass,
             datetime(2000, 1, 1, tzinfo=UTC),
@@ -523,8 +524,22 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             None,
             {"sum"},
         )
-        rows = stats.get(statistic_id)
-        return datetime.fromtimestamp(rows[0]["start"], paris_tz) if rows else None
+        if not months.get(statistic_id):
+            return None
+        # The oldest month, in Home Assistant's time zone, then its oldest point
+        month = datetime.fromtimestamp(months[statistic_id][0]["start"], UTC)
+        points = await instance.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            month,
+            month + timedelta(days=32),
+            {statistic_id},
+            "hour",
+            None,
+            {"sum"},
+        )
+        first = (points.get(statistic_id) or months[statistic_id])[0]["start"]
+        return datetime.fromtimestamp(first, paris_tz)
 
     async def _async_get_sums_before(
         self, statistic_ids: set[str], before: datetime
