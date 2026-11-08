@@ -604,6 +604,8 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         return await self.api.async_get_daily_usage(
             house,
             # datetime.fromtimestamp(last_stat_time) - timedelta(days=30),
-            datetime.fromtimestamp(last_stat_time),
-            datetime.now(),
+            # Paris dates: in a process running in UTC, the last point at
+            # Paris midnight falls on the day before
+            datetime.fromtimestamp(last_stat_time, paris_tz),
+            datetime.now(paris_tz),
         )

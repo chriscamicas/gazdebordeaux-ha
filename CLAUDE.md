@@ -81,6 +81,10 @@ The coordinator runs every 12h but the JWT expires sooner, so `_async_update_dat
 
 `_async_update_data` fetches the totals for the sensors, starts `_async_insert_statistics_logged` as a background task of the config entry (one at a time; unloading the entry, as a reload does, cancels it) and returns. A failure on one energy is logged and retried at the next update, without stopping the other one. Tests that drive `_async_update_data` must wait with `hass.async_block_till_done(wait_background_tasks=True)`.
 
+### Paris dates, whatever the process time zone
+
+Don't turn a statistic's timestamp into a date with a naive `datetime.fromtimestamp()`: in a process running in UTC (a container without `TZ`), the point at Paris midnight falls on the day before. Life was then asked for the recent days from that earlier day, and the update started from that day's running sum, dropping the last day from the total. Pass `paris_tz`.
+
 ## Local testing
 
 There is no committed repro script any more. To hit the real API fast, write a throwaway script that puts `custom_components/gazdebordeaux` on `sys.path` and imports `gazdebordeaux` directly. That module has no `homeassistant` import, only `aiohttp` and `pytz`. Then drive `Gazdebordeaux(session, username, password)` with DEBUG logging, which shows request URLs, response status, content-type and body for every call.

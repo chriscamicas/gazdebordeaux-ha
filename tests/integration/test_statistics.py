@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import time
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
@@ -617,3 +618,37 @@ async def test_failed_import_keeps_the_totals_and_the_other_energy(hass: HomeAss
 
     assert set(data) == {"gas", "electricity"}
     assert imported == ["electricity"]
+
+
+@pytest.mark.parametrize("process_tz", ["UTC", "America/New_York"])
+async def test_daily_sums_whatever_the_process_time_zone(
+    hass: HomeAssistant, monkeypatch, process_tz: str
+) -> None:
+    # West of Paris, the last point at Paris midnight fell on the day before:
+    # Life was asked from there, and the update started from that day's sum
+    await hass.config.async_set_time_zone("Europe/Paris")
+    reads = [_read(1, 10, 2.0), _read(2, 5, 1.0), _read(3, 7, 1.5)]
+    published = [2]
+
+    async def daily(
+        self: object, house: str, start: datetime, end: datetime
+    ) -> list[DailyUsageRead]:
+        # Like Life: the days from startDate on, up to the last one out
+        return [r for r in reads[: published[0]] if r.date.date() >= start.date()]
+
+    coordinator = GdbCoordinator(hass, _electricity_entry(hass))
+    monkeypatch.setenv("TZ", process_tz)
+    time.tzset()
+    try:
+        with patch(f"{API}.async_get_daily_usage", new=daily):
+            await coordinator._insert_statistics("electricity", ELEC)
+            await async_wait_recording_done(hass)
+            published[0] = 3
+            await coordinator._insert_statistics("electricity", ELEC)
+            await async_wait_recording_done(hass)
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+    rows = await _hourly_rows(hass, f"{DOMAIN}:electricity_consumption")
+    assert [(r["state"], r["sum"]) for r in rows] == [(10, 10), (5, 15), (7, 22)]
