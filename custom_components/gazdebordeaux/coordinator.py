@@ -1,10 +1,11 @@
 """Coordinator to handle Opower connections."""
 
+import asyncio
 import dataclasses
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 from homeassistant.components.recorder.models import (
@@ -43,6 +44,22 @@ from .const import (
 from .gazdebordeaux import DailyUsageRead, Gazdebordeaux, TotalUsageRead, paris_tz
 
 _LOGGER = logging.getLogger(__name__)
+
+# Offset of Paris mean time, which pytz's replace() picks: statistics stored
+# before 1.3.0 are dated with it, at hh:51 in Paris time
+_LMT_OFFSET = cast(timedelta, datetime(2000, 1, 1).replace(tzinfo=paris_tz).utcoffset())
+
+
+def _is_whole_hour(ts: float) -> bool:
+    return datetime.fromtimestamp(ts, paris_tz).minute == 0
+
+
+def _whole_hour_start(ts: float) -> datetime:
+    """The start of a point on the whole Paris hour, if it is dated in Paris mean time."""
+    if _is_whole_hour(ts):
+        return datetime.fromtimestamp(ts, paris_tz)
+    wall_clock = datetime.fromtimestamp(ts, UTC).replace(tzinfo=None) + _LMT_OFFSET
+    return paris_tz.localize(wall_clock)
 
 
 def _has_usage(usage_reads: list[DailyUsageRead]) -> bool:
@@ -157,6 +174,7 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=entry,
             name="gazdebordeaux",
             # Data is updated daily.
             # Refresh every 12h to be at most 12h behind.
@@ -165,6 +183,9 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
 
         # Initialisation de la date de dernière actualisation
         self.last_update: datetime | None = None
+        # Statistics import running in the background, see _async_update_data
+        self._statistics_task: asyncio.Task | None = None
+        self._entry = entry
 
         entry_data = entry.data
 
@@ -180,15 +201,16 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             entry_data[CONF_USERNAME],
             entry_data[CONF_PASSWORD],
         )
-        self.reset = False
-        if RESET_STATISTICS in entry_data:
-            self.reset = bool(entry_data[RESET_STATISTICS])
-            if self.reset:
-                _LOGGER.debug("Asked to reset all statistics...")
-                _LOGGER.debug("Updating config...")
-                self.hass.config_entries.async_update_entry(
-                    entry, data={**entry_data, RESET_STATISTICS: False}
-                )
+        # Energies whose statistics the "reset statistics" option asked to
+        # import again; each one leaves the set once that is done
+        self._reset_pending: set[str] = set()
+        if entry_data.get(RESET_STATISTICS):
+            _LOGGER.debug("Asked to reset all statistics...")
+            self._reset_pending = set(self.houses)
+            _LOGGER.debug("Updating config...")
+            self.hass.config_entries.async_update_entry(
+                entry, data={**entry_data, RESET_STATISTICS: False}
+            )
 
         @callback
         def _dummy_listener() -> None:
@@ -216,19 +238,34 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         for energy in self.houses:
             if self.houses[energy] == AUTO:
                 self.houses[energy] = await self.api.async_find_house(energy)
-            house = self.houses[energy]
+            data[energy] = await self.api.async_get_total_usage(self.houses[energy])
 
-            data[energy] = await self.api.async_get_total_usage(house)
-
-            # Because Opower provides historical usage/cost with a delay of a couple of days
-            # we need to insert data into statistics.
-            await self._insert_statistics(energy, house)
+        # Because Opower provides historical usage/cost with a delay of a couple of days
+        # we need to insert data into statistics. That runs in the background,
+        # so that a slow or failing import (a rebuild, Life's edge filter)
+        # holds neither the config entry setup, which Home Assistant cancels
+        # after a while, nor the sensors. Unloading the entry, as a reload
+        # does, cancels it: the next coordinator starts its own.
+        if self._statistics_task is None or self._statistics_task.done():
+            self._statistics_task = self._entry.async_create_background_task(
+                self.hass,
+                self._async_insert_statistics_logged(dict(self.houses)),
+                "gazdebordeaux statistics import",
+            )
 
         # Mise à jour de la date de dernière actualisation
         self.last_update = datetime.now()
         _LOGGER.debug("Last update: %s", self.last_update.strftime("%Y-%m-%d %H:%M:%S"))
 
         return data
+
+    async def _async_insert_statistics_logged(self, houses: dict[str, str]) -> None:
+        """Insert the statistics of each energy, logging failures; the next update retries."""
+        for energy, house in houses.items():
+            try:
+                await self._insert_statistics(energy, house)
+            except Exception:
+                _LOGGER.exception("Importing the Gaz de Bordeaux %s statistics failed", energy)
 
     async def _insert_statistics(self, energy: str, house: str) -> None:
         """Insert gdb statistics for one energy type."""
@@ -237,17 +274,29 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         anchor_statistic_id = specs[0].statistic_id
         _LOGGER.debug("Updating Statistics for %s", ", ".join(sorted(statistic_ids)))
 
-        if self.reset:
-            _LOGGER.debug("Resetting all statistics...")
-
         last_stats = await get_instance(self.hass).async_add_executor_job(
             get_last_statistics, self.hass, 2, anchor_statistic_id, True, set()
         )
         # Newest first.
         last_rows = last_stats.get(anchor_statistic_id, [])
 
+        if energy in self._reset_pending:
+            # The "reset statistics" option
+            since = await self._async_get_first_day(anchor_statistic_id)
+            await self._insert_full_history(
+                specs, house, await self._async_get_all_data(house, since), rebuild="on request"
+            )
+            self._reset_pending.discard(energy)
+            return
+
+        if last_rows and not _is_whole_hour(float(last_rows[0]["start"])):
+            # The next update goes on from the moved points
+            await self._move_to_whole_hours(specs)
+            return
+
         if last_rows and _is_monthly_series(last_rows):
-            all_reads = await self._async_get_all_data(house)
+            since = await self._async_get_first_day(anchor_statistic_id)
+            all_reads = await self._async_get_all_data(house, since)
             if not _has_usage(all_reads):
                 await self._insert_monthly_statistics(
                     specs, house, cast(float, last_rows[0]["start"])
@@ -256,12 +305,9 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             # The contract started returning daily data (e.g. the customer turned
             # on daily reporting). Continuing from the last monthly point would
             # count its month twice: rebuild the series from scratch instead.
-            _LOGGER.info(
-                "Daily data is now available for %s, rebuilding its statistics",
-                anchor_statistic_id,
+            await self._insert_full_history(
+                specs, house, all_reads, rebuild="now that daily data is available"
             )
-            get_instance(self.hass).async_clear_statistics(sorted(statistic_ids))
-            await self._insert_full_history(specs, house, all_reads)
             return
 
         if not last_rows:
@@ -269,7 +315,13 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             await self._insert_full_history(specs, house, await self._async_get_all_data(house))
             return
 
-        last_stat_ts = cast(float, last_rows[0]["start"])
+        await self._insert_recent_reads(specs, house, cast(float, last_rows[0]["start"]))
+
+    async def _insert_recent_reads(
+        self, specs: tuple[StatisticSpec, ...], house: str, last_stat_ts: float
+    ) -> None:
+        """Add the reads after the last imported point, on top of its sums."""
+        statistic_ids = {spec.statistic_id for spec in specs}
         last_stat_date = datetime.fromtimestamp(last_stat_ts)
         _LOGGER.debug("Last stat found for %s...", last_stat_date.strftime("%Y-%m-%d"))
         usage_reads = await self._async_get_recent_usage_reads(house, last_stat_ts)
@@ -316,8 +368,28 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         specs: tuple[StatisticSpec, ...],
         house: str,
         daily_reads: list[DailyUsageRead],
+        rebuild: str | None = None,
     ) -> None:
-        """Import the whole history into empty statistics.
+        """Import the whole history into empty statistics, or in place of them.
+
+        When rebuilding, the existing statistics are only cleared once all the
+        new data is downloaded: a failure on the way leaves them untouched.
+        """
+        reads = await self._full_history_reads(house, daily_reads)
+        statistic_ids = sorted({spec.statistic_id for spec in specs})
+        if rebuild:
+            if not _has_usage(reads):
+                # Treated like a failed download: keep what is there
+                raise Exception(f"No usage to rebuild {', '.join(statistic_ids)} with")
+            _LOGGER.info("Rebuilding %s %s", ", ".join(statistic_ids), rebuild)
+            # The recorder runs the clear before the imports queued after it
+            get_instance(self.hass).async_clear_statistics(statistic_ids)
+        self._import_reads(specs, reads, dict.fromkeys(statistic_ids, 0.0))
+
+    async def _full_history_reads(
+        self, house: str, daily_reads: list[DailyUsageRead]
+    ) -> list[DailyUsageRead]:
+        """The reads that make up the whole history, oldest first.
 
         Daily reads are used wherever they exist. A contract can have daily data
         only from some point on (e.g. electricity once daily reporting is turned
@@ -327,24 +399,26 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         cover, so the totals match the website's.
         """
         if not _has_usage(daily_reads):
-            await self._insert_monthly_statistics(specs, house, None)
-            return
+            # From January 1st of last year, or earlier on a rebuild of an
+            # older history
+            start = datetime(datetime.now().year - 1, 1, 1)
+            if daily_reads:
+                start = min(start, min(read.date for read in daily_reads).replace(tzinfo=None))
+            _LOGGER.debug("No daily data, importing monthly data since %s", start.strftime("%Y-%m"))
+            usage_reads = await self.api.async_get_monthly_usage(house, start, datetime.now())
+            return [read for read in usage_reads if read.date.replace(tzinfo=None) >= start]
 
-        statistic_ids = {spec.statistic_id for spec in specs}
-        sums = {statistic_id: 0.0 for statistic_id in statistic_ids}
         first_day = next(read for read in daily_reads if _has_usage([read])).date
         first_month = (first_day.year, first_day.month)
         start = min(read.date for read in daily_reads).replace(tzinfo=None)
         if (start.year, start.month) >= first_month:
-            self._import_reads(specs, daily_reads, sums)
-            return
+            return daily_reads
 
         monthly_reads = await self.api.async_get_monthly_usage(house, start, datetime.now())
         before = [read for read in monthly_reads if _month_of(read) < first_month]
         if not _has_usage(before):
             # Plain daily contract whose history starts later (e.g. a new contract).
-            self._import_reads(specs, daily_reads, sums)
-            return
+            return daily_reads
 
         _LOGGER.debug(
             "Daily data starts on %s, importing monthly data before it",
@@ -362,10 +436,10 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             ]
             daily_from = [read for read in daily_from if read.date != transition.date]
             daily_from.insert(0, _subtract(transition, others))
-        self._import_reads(specs, before + daily_from, sums)
+        return before + daily_from
 
     async def _insert_monthly_statistics(
-        self, specs: tuple[StatisticSpec, ...], house: str, last_stat_ts: float | None
+        self, specs: tuple[StatisticSpec, ...], house: str, last_stat_ts: float
     ) -> None:
         """Insert one statistic per month, for contracts without daily data.
 
@@ -374,14 +448,10 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         """
         statistic_ids = {spec.statistic_id for spec in specs}
         now = datetime.now()
-        if last_stat_ts is None:
-            start = datetime(now.year - 1, 1, 1)
-            sums = {statistic_id: 0.0 for statistic_id in statistic_ids}
-        else:
-            last_stat_date = datetime.fromtimestamp(last_stat_ts, paris_tz)
-            last_month = datetime(last_stat_date.year, last_stat_date.month, 1)
-            start = (last_month - timedelta(days=1)).replace(day=1)
-            sums = await self._async_get_sums_before(statistic_ids, start.replace(tzinfo=paris_tz))
+        last_stat_date = datetime.fromtimestamp(last_stat_ts, paris_tz)
+        last_month = datetime(last_stat_date.year, last_stat_date.month, 1)
+        start = (last_month - timedelta(days=1)).replace(day=1)
+        sums = await self._async_get_sums_before(statistic_ids, paris_tz.localize(start))
         _LOGGER.debug("No daily data, importing monthly data since %s", start.strftime("%Y-%m"))
 
         usage_reads = await self.api.async_get_monthly_usage(house, start, now)
@@ -408,6 +478,72 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
                     StatisticData(start=usage_read.date, state=value, sum=sums[spec.statistic_id])
                 )
         self._add_statistics(specs, statistics)
+
+    async def _move_to_whole_hours(self, specs: tuple[StatisticSpec, ...]) -> None:
+        """Move the points dated in Paris mean time (before 1.3.0) to whole hours.
+
+        Only their start changes. Importing them again from Life instead would
+        lose the days before the ones it returns.
+        """
+        stats = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            datetime(2000, 1, 1, tzinfo=UTC),
+            None,
+            {spec.statistic_id for spec in specs},
+            "hour",
+            None,
+            {"state", "sum"},
+        )
+        moved = {
+            statistic_id: [
+                StatisticData(
+                    start=_whole_hour_start(row["start"]),
+                    state=float(row["state"] or 0),
+                    sum=float(row["sum"] or 0),
+                )
+                for row in rows
+            ]
+            for statistic_id, rows in stats.items()
+        }
+        _LOGGER.info("Moving %s to whole hours", ", ".join(sorted(moved)))
+        # The recorder runs the clear before the imports queued after it
+        get_instance(self.hass).async_clear_statistics(sorted(moved))
+        self._add_statistics(tuple(spec for spec in specs if spec.statistic_id in moved), moved)
+
+    async def _async_get_first_day(self, statistic_id: str) -> datetime | None:
+        """When the oldest point of `statistic_id` starts, if it has any.
+
+        A rebuild imports again from there: the first import's range (since
+        January 1st of last year) can start later than the existing history.
+        """
+        instance = get_instance(self.hass)
+        months = await instance.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            datetime(2000, 1, 1, tzinfo=UTC),
+            None,
+            {statistic_id},
+            "month",
+            None,
+            {"sum"},
+        )
+        if not months.get(statistic_id):
+            return None
+        # The oldest month, in Home Assistant's time zone, then its oldest point
+        month = datetime.fromtimestamp(months[statistic_id][0]["start"], UTC)
+        points = await instance.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            month,
+            month + timedelta(days=32),
+            {statistic_id},
+            "hour",
+            None,
+            {"sum"},
+        )
+        first = (points.get(statistic_id) or months[statistic_id])[0]["start"]
+        return datetime.fromtimestamp(first, paris_tz)
 
     async def _async_get_sums_before(
         self, statistic_ids: set[str], before: datetime
@@ -447,17 +583,16 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             )
             async_add_external_statistics(self.hass, metadata, statistics[spec.statistic_id])
 
-    async def _async_get_all_data(self, house: str) -> list[DailyUsageRead]:
-        """Get all cost reads since account activation, at different resolutions by age.
-
-        - month resolution for all years (since account activation)
-        - day resolution for past 3 years (if account's read resolution supports it)
-        - hour resolution for past 2 months (if account's read resolution supports it)
-        """
+    async def _async_get_all_data(
+        self, house: str, since: datetime | None = None
+    ) -> list[DailyUsageRead]:
+        """Get the daily reads since January 1st of last year, or since `since` if older."""
         usage_reads = []
 
         # if start=None it will only default to beginning of current year, let's import 1 year more
         start = datetime(datetime.today().year - 1, 1, 1)
+        if since is not None:
+            start = min(start, datetime(since.year, since.month, since.day))
         end = datetime.now()
         usage_reads = await self.api.async_get_daily_usage(house, start, end)
         return usage_reads
@@ -469,6 +604,8 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         return await self.api.async_get_daily_usage(
             house,
             # datetime.fromtimestamp(last_stat_time) - timedelta(days=30),
-            datetime.fromtimestamp(last_stat_time),
-            datetime.now(),
+            # Paris dates: in a process running in UTC, the last point at
+            # Paris midnight falls on the day before
+            datetime.fromtimestamp(last_stat_time, paris_tz),
+            datetime.now(paris_tz),
         )

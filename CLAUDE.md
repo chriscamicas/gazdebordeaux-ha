@@ -46,9 +46,9 @@ The `selectedHouse` value comes back in two shapes depending on the account:
 
 Electricity `/consumptions` responses have the same shape as gas (`kwh`, `price`, `volumeOfEnergy`, `ratio`, `temperature`, …) with `volumeOfEnergy`/`ratio` at 0. Days or months without data may only carry a subset of keys, so read the optional ones with `.get()`. Some electricity contracts expose **no daily data at all**: `scale=month|week|day` return every day with `kwh: 0` (the website's own day/week charts are empty too), while `scale=year` with `startDate`/`endDate` returns real per-month figures keyed `YYYY-MM`. The coordinator detects this (daily history all zero) and imports monthly points instead (`_insert_monthly_statistics`), rewriting from the month before the last imported one on top of the running sum just before it. Recent zero days alone never trigger the fallback, because gas can legitimately have zero days.
 
-A contract can switch to daily data later, once the customer turns on daily reporting on the website. Daily history then starts on that day; it isn't backfilled. Observed in November 2026: zero every day through 4 Oct, real days from 5 Oct, and 1–4 Oct only present in October's `scale=year` figure. `_insert_full_history` handles that by importing monthly points for the months before the first day with data. It then adds a point on the 1st of that month holding the monthly figure minus the month's daily reads, followed by the daily reads, so totals match the website's. When an existing series is monthly (`_is_monthly_series`: the two newest points are a month apart, on the 1st) and daily data shows up, the series is cleared and rebuilt with `_insert_full_history`.
+A contract can switch to daily data later, once the customer turns on daily reporting on the website. Daily history then starts on that day; it isn't backfilled. Observed in November 2026: zero every day through 4 Oct, real days from 5 Oct, and 1–4 Oct only present in October's `scale=year` figure. `_insert_full_history` handles that by importing monthly points for the months before the first day with data. It then adds a point on the 1st of that month holding the monthly figure minus the month's daily reads, followed by the daily reads, so totals match the website's. When an existing series is monthly (`_is_monthly_series`: the two newest points are a month apart, on the 1st) and daily data shows up, the series is rebuilt with `_insert_full_history(..., rebuild=...)`. The "reset statistics" option goes through it too. A rebuild downloads everything before clearing the series, so a failed download leaves them untouched, and starts from the oldest existing point (`_async_get_first_day`), which can be older than the first import's range.
 
-Note that `DailyUsageRead.date` uses `.replace(tzinfo=paris_tz)` (pytz LMT, +00:09). Existing gas statistics are stored with that offset, so don't "fix" it to `localize()` without migrating them.
+`DailyUsageRead.date` uses `paris_tz.localize()`. pytz's `.replace(tzinfo=paris_tz)` picks Paris mean time (LMT, +00:09) and puts each point at hh:51 in Paris time, which is how statistics were stored before 1.3.0. When the newest point of a series is off the hour, `_move_to_whole_hours` moves every point of that energy's series to the whole hour, in place (same states and sums). Importing them again from Life instead would lose the days before the first import's range. `_is_first_of_month` accepts both offsets.
 
 ### Config entry shape (version 2)
 
@@ -76,6 +76,14 @@ Voluptuous applies `default=` whenever the key is absent from input. HA's fronte
 ### Coordinator update interval vs. login expiry
 
 The coordinator runs every 12h but the JWT expires sooner, so `_async_update_data` calls `async_login()` on every refresh. Don't add caching that skips that re-login or you'll start chasing intermittent 401s.
+
+### Statistics import runs in the background
+
+`_async_update_data` fetches the totals for the sensors, starts `_async_insert_statistics_logged` as a background task of the config entry (one at a time; unloading the entry, as a reload does, cancels it) and returns. A failure on one energy is logged and retried at the next update, without stopping the other one. Tests that drive `_async_update_data` must wait with `hass.async_block_till_done(wait_background_tasks=True)`.
+
+### Paris dates, whatever the process time zone
+
+Don't turn a statistic's timestamp into a date with a naive `datetime.fromtimestamp()`: in a process running in UTC (a container without `TZ`), the point at Paris midnight falls on the day before. Life was then asked for the recent days from that earlier day, and the update started from that day's running sum, dropping the last day from the total. Pass `paris_tz`.
 
 ## Local testing
 
