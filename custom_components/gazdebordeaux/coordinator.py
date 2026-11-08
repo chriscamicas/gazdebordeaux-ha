@@ -57,6 +57,11 @@ HOURLY_MAX_DAYS = 730
 HOURLY_REQUEST_DELAY = 0.2
 # Hourly data of the last days may not be published yet: wait for it
 HOURLY_GRACE_DAYS = 3
+# Life publishes each day's reads two days later, during the day
+PUBLICATION_DELAY = timedelta(days=2)
+# Usual pace, and the one while the day Life should publish next is missing
+UPDATE_INTERVAL = timedelta(hours=12)
+WAITING_UPDATE_INTERVAL = timedelta(hours=1)
 
 # Offset of Paris mean time, which pytz's replace() picks: statistics stored
 # before 1.3.0 are dated with it, at hh:51 in Paris time
@@ -241,9 +246,9 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             _LOGGER,
             config_entry=entry,
             name="gazdebordeaux",
-            # Data is updated daily.
-            # Refresh every 12h to be at most 12h behind.
-            update_interval=timedelta(hours=12),
+            # Every 12 hours, or every hour while the next day is due:
+            # see _next_update_interval
+            update_interval=UPDATE_INTERVAL,
         )
 
         # Initialisation de la date de dernière actualisation
@@ -251,6 +256,9 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         # Statistics import running in the background, see _async_update_data
         self._statistics_task: asyncio.Task | None = None
         self._entry = entry
+        # Day of the last point of each energy's statistics, by the first
+        # statistic id of the energy, once known
+        self._last_days: dict[str, date] = {}
 
         entry_data = entry.data
 
@@ -291,9 +299,11 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         self,
     ) -> dict[str, TotalUsageRead]:
         """Fetch data from API endpoint."""
+        # Applies to the next update, scheduled once this one returns
+        self.update_interval = self._next_update_interval()
         try:
             # Login expires after a few minutes.
-            # Given the infrequent updating (every 12h)
+            # Given the infrequent updating (hourly at most)
             # assume previous session has expired and re-login.
             await self.api.async_login()
         except Exception as err:
@@ -343,6 +353,9 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         )
         # Newest first.
         last_rows = last_stats.get(anchor_statistic_id, [])
+        if last_rows:
+            last_start = datetime.fromtimestamp(float(last_rows[0]["start"]), paris_tz)
+            self._last_days[anchor_statistic_id] = last_start.date()
         details = await self._async_get_house_details(house)
         specs = tuple(s for s in all_specs if details.offpeak is not None or not s.peak_offpeak)
         has_peak_offpeak = await self._async_has_peak_offpeak(all_specs)
@@ -642,6 +655,23 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
                     StatisticData(start=usage_read.date, state=value, sum=sums[spec.statistic_id])
                 )
         self._add_statistics(specs, statistics)
+        if usage_reads:
+            self._last_days[specs[0].statistic_id] = usage_reads[-1].date.date()
+
+    def _next_update_interval(self) -> timedelta:
+        """Poll hourly while the day Life should publish next is missing.
+
+        Life publishes each day's reads two days later, during the day. When
+        more than that day is missing, Life itself is late: keep the usual
+        pace rather than ask every hour for days.
+        """
+        expected = datetime.now(paris_tz).date() - PUBLICATION_DELAY
+        for energy in self.houses:
+            last_day = self._last_days.get(ENERGY_STATISTICS[energy][0].statistic_id)
+            # Not known before the first import: look again soon
+            if last_day is None or last_day == expected - timedelta(days=1):
+                return WAITING_UPDATE_INTERVAL
+        return UPDATE_INTERVAL
 
     async def _move_to_whole_hours(self, specs: tuple[StatisticSpec, ...]) -> None:
         """Move the points dated in Paris mean time (before 1.3.0) to whole hours.

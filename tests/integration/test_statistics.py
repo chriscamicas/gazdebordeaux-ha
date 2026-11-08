@@ -31,7 +31,12 @@ from custom_components.gazdebordeaux.const import (
     NONE,
     RESET_STATISTICS,
 )
-from custom_components.gazdebordeaux.coordinator import ENERGY_STATISTICS, GdbCoordinator
+from custom_components.gazdebordeaux.coordinator import (
+    ENERGY_STATISTICS,
+    UPDATE_INTERVAL,
+    WAITING_UPDATE_INTERVAL,
+    GdbCoordinator,
+)
 from custom_components.gazdebordeaux.gazdebordeaux import (
     DailyUsageRead,
     Gazdebordeaux,
@@ -1148,3 +1153,65 @@ async def test_the_remainder_on_the_1st_splits_peak_and_offpeak_too(hass: HomeAs
     # September's figure, then October's remainder on the 1st and its days
     assert [round(r["state"], 3) for r in hc] == [208, 16, 0, 4, 5]
     assert hc[-1]["sum"] == pytest.approx(208 + 25)
+
+
+# ---------- update pace ----------------------------------------------------
+
+
+async def test_poll_hourly_while_the_expected_day_is_missing(hass: HomeAssistant) -> None:
+    # Life publishes each day two days later, during the day: until that day
+    # is in, look again every hour rather than every 12 hours
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=5))
+    api.hourly_until = api.last_day - timedelta(days=1)
+    coordinator = _fake_coordinator(hass, api)
+
+    async def update() -> timedelta | None:
+        await coordinator._async_update_data()
+        await hass.async_block_till_done(wait_background_tasks=True)
+        await async_wait_recording_done(hass)
+        return coordinator.update_interval
+
+    # The last imported day is not known before the first import
+    assert await update() == WAITING_UPDATE_INTERVAL
+    # The curve of the day before yesterday is not out yet
+    assert await update() == WAITING_UPDATE_INTERVAL
+    api.hourly_until = api.last_day
+    # The interval is chosen before the import that brings the day in
+    assert await update() == WAITING_UPDATE_INTERVAL
+    assert await update() == UPDATE_INTERVAL
+    assert max(_days(await _all_rows(hass, CONSUMPTION))) == api.last_day
+
+
+async def test_keep_the_usual_pace_when_life_is_late(hass: HomeAssistant) -> None:
+    # More than the expected day is missing: Life itself is late, no need to
+    # ask it every hour for days
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=8))
+    api.last_day = api.hourly_until = api.today - timedelta(days=4)
+    coordinator = _fake_coordinator(hass, api)
+
+    await coordinator._insert_statistics("electricity", ELEC)
+
+    assert coordinator._next_update_interval() == UPDATE_INTERVAL
+
+
+async def test_any_energy_waiting_sets_the_pace(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        data={
+            CONF_USERNAME: "user@example.com",
+            CONF_PASSWORD: "secret",
+            CONF_GAS_HOUSE: GAS,
+            CONF_ELECTRICITY_HOUSE: ELEC,
+        },
+    )
+    entry.add_to_hass(hass)
+    coordinator = GdbCoordinator(hass, entry)
+    expected = datetime.now(PARIS).date() - timedelta(days=2)
+    coordinator._last_days[f"{DOMAIN}:energy_consumption"] = expected
+    coordinator._last_days[CONSUMPTION] = expected
+    assert coordinator._next_update_interval() == UPDATE_INTERVAL
+
+    # Electricity still waits for the day Life should publish next
+    coordinator._last_days[CONSUMPTION] = expected - timedelta(days=1)
+    assert coordinator._next_update_interval() == WAITING_UPDATE_INTERVAL

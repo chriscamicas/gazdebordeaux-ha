@@ -87,7 +87,7 @@ Voluptuous applies `default=` whenever the key is absent from input. HA's fronte
 
 ### Coordinator update interval vs. login expiry
 
-The coordinator runs every 12h but the JWT expires sooner, so `_async_update_data` calls `async_login()` on every refresh. Don't add caching that skips that re-login or you'll start chasing intermittent 401s.
+The coordinator runs every 12h, or every hour while the day Life should publish next is missing (Life publishes each day two days later, during the day: see `_next_update_interval`), but the JWT expires sooner, so `_async_update_data` calls `async_login()` on every refresh. Don't add caching that skips that re-login or you'll start chasing intermittent 401s.
 
 ### Statistics import runs in the background
 
