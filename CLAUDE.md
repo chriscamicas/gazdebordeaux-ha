@@ -56,13 +56,19 @@ A contract can switch to daily data later, once the customer turns on daily repo
 
 The coordinator imports days hour by hour from `hourlyMeasureStartDate`, within the two years Life keeps (`HOURLY_MAX_DAYS`); without it, or when the house resource can't be read, everything stays daily. `_with_hourly_reads` never touches monthly points (`DailyUsageRead.monthly`), keeps a day's daily read when its hours are more than 10 % off, and stops at a recent day without hours (`HOURLY_GRACE_DAYS`) so that the next update picks it up hour by hour. Incremental updates start from the sums of the last points (`_async_get_last_sums`), not from a recorder day period, which follows Home Assistant's time zone.
 
+### Peak / off-peak contracts
+
+The house resource of an HP/HC contract has `priceCategory: "HPHC"` and its off-peak ranges as `[["H:MM", "H:MM"], …]`: `offPeakTimes`, or `offPeakTimesHighSeason` (November to March) and `offPeakTimesLowSeason` for seasonal ones. Daily and monthly reads carry `isHphc`, `consumptionHp`, `consumptionHc`, `priceHp`, `priceHc` and `contractPrice` (the subscription share of `price`). Some HP/HC days come with `kwh` and `price` at 0 while the periods are filled; the parser then uses their sum, as Life's totals do. Each half hour of the load curve goes to its period by its start time, and `_split_peak_offpeak` prices each hour at its period's rate, the subscription spread evenly over the day's hours.
+
+The peak and off-peak series (`peak_offpeak` specs) are only written for contracts with ranges. An existing series without them is rebuilt once to add them. When the house comes back without ranges while they exist, the update is skipped, so that they don't get a hole for good; a reset clears every series of the energy, which is the way out after a contract change.
+
 ### Config entry shape (version 2)
 
 `username`, `password`, `reset_stats`, `gas_house`, `electricity_house`. Each house value is a normalized `/api/houses/{uuid}` path, `"none"`, or (gas only, from migration) `"auto"`. The house selectors are `vol.Required` with an explicit `"none"` option, which sidesteps the Optional-default pitfall below.
 
 ### Statistic IDs
 
-Gas keeps its pre-1.2 IDs (`gazdebordeaux:energy_consumption`, `:energy_cost`, `:volume`) so that history survives. Electricity uses `gazdebordeaux:electricity_consumption` and `:electricity_cost`. Both are declared in `ENERGY_STATISTICS` in `coordinator.py`. Cost statistics need `unit_class=None`: the recorder rejects any unit class without a unit converter, and `"monetary"` has none.
+Gas keeps its pre-1.2 IDs (`gazdebordeaux:energy_consumption`, `:energy_cost`, `:volume`) so that history survives. Electricity uses `gazdebordeaux:electricity_consumption` and `:electricity_cost`, plus `:electricity_consumption_hp` / `_hc` and `:electricity_cost_hp` / `_hc` for peak / off-peak contracts (costs without the subscription). All are declared in `ENERGY_STATISTICS` in `coordinator.py`. Cost statistics need `unit_class=None`: the recorder rejects any unit class without a unit converter, and `"monetary"` has none.
 
 ### Login response on bad credentials vs. blocked request
 

@@ -15,6 +15,8 @@ INPUT_DATE_FORMAT = "%Y-%m-%d"
 INPUT_MONTH_FORMAT = "%Y-%m"
 # Interval of the load curve returned by the "day" scale
 CURVE_STEP = timedelta(minutes=30)
+# Months of the high season of seasonal off-peak hours (November to March)
+HIGH_SEASON_MONTHS = (11, 12, 1, 2, 3)
 
 # Browser-like headers. The WAF on life.gazdebordeaux.fr rejects requests that
 # don't look like the SPA (same-origin fetch from the web app).
@@ -69,8 +71,40 @@ class DailyUsageRead:
     price: float
     ratio: float
     temperature: float
+    # Peak / off-peak split, filled for HP/HC electricity contracts.
+    # contractPrice is the subscription share included in price.
+    isHphc: bool = False
+    consumptionHp: float = 0.0
+    consumptionHc: float = 0.0
+    priceHp: float = 0.0
+    priceHc: float = 0.0
+    contractPrice: float = 0.0
     # A monthly figure (scale=year), dated on the 1st
     monthly: bool = False
+
+
+# Off-peak ranges of a contract, as Life gives them: [["22:00", "6:00"], ...].
+# With seasonal off-peak hours, "high" applies from November to March.
+@dataclasses.dataclass
+class OffPeakTimes:
+    all: list
+    high: list
+    low: list
+
+    def ranges(self, day: date) -> list:
+        if self.high and self.low:
+            return self.high if day.month in HIGH_SEASON_MONTHS else self.low
+        return self.all
+
+    def is_offpeak(self, day: date, minute: int) -> bool:
+        for start, end in self.ranges(day):
+            first, last = _minutes(start), _minutes(end)
+            if first <= last:
+                if first <= minute < last:
+                    return True
+            elif minute >= first or minute < last:
+                return True
+        return False
 
 
 @dataclasses.dataclass
@@ -79,6 +113,8 @@ class HouseDetails:
 
     # First day of the half-hourly load curve, if the customer turned it on
     hourly_start: date | None
+    # Off-peak ranges, for peak / off-peak contracts
+    offpeak: OffPeakTimes | None = None
 
 
 # ----------------------------------------------------------------------------
@@ -210,9 +246,27 @@ class Gazdebordeaux:
                     price=daily_data[d]["price"],
                     ratio=daily_data[d].get("ratio", 0),
                     temperature=daily_data[d].get("temperature", 0),
+                    isHphc=bool(daily_data[d].get("isHphc")),
+                    consumptionHp=daily_data[d].get("consumptionHp") or 0.0,
+                    consumptionHc=daily_data[d].get("consumptionHc") or 0.0,
+                    priceHp=daily_data[d].get("priceHp") or 0.0,
+                    priceHc=daily_data[d].get("priceHc") or 0.0,
+                    contractPrice=daily_data[d].get("contractPrice") or 0.0,
                     monthly=date_format == INPUT_MONTH_FORMAT,
                 )
             )
+
+        # Some days of HP/HC contracts come with kwh and price at 0 while
+        # their peak / off-peak values are filled; Life's own totals add the
+        # two periods, so do the same.
+        for read in usage_reads:
+            if not read.isHphc:
+                continue
+            split = read.consumptionHp + read.consumptionHc
+            if split and abs(read.amountOfEnergy - split) > 0.05:
+                read.amountOfEnergy = split
+            if not read.price and (read.priceHp or read.priceHc):
+                read.price = read.priceHp + read.priceHc + read.contractPrice
 
         return usage_reads
 
@@ -222,6 +276,16 @@ class Gazdebordeaux:
         if not isinstance(data, dict):
             return HouseDetails(hourly_start=None)
 
+        offpeak: OffPeakTimes | None = None
+        if data.get("priceCategory") == "HPHC":
+            times = OffPeakTimes(
+                all=data.get("offPeakTimes") or [],
+                high=data.get("offPeakTimesHighSeason") or [],
+                low=data.get("offPeakTimesLowSeason") or [],
+            )
+            if times.all or (times.high and times.low):
+                offpeak = times
+
         hourly_start: date | None = None
         start = data.get("hourlyMeasureStartDate")
         if isinstance(start, str):
@@ -230,12 +294,16 @@ class Gazdebordeaux:
             except ValueError:
                 Logger.warning("Unexpected hourlyMeasureStartDate %r", start)
 
-        details = HouseDetails(hourly_start=hourly_start)
+        details = HouseDetails(hourly_start=hourly_start, offpeak=offpeak)
         Logger.debug("House details: %s", details)
         return details
 
     async def async_get_hourly_usage(
-        self, house: str, day: date, daily_energy: float | None = None
+        self,
+        house: str,
+        day: date,
+        daily_energy: float | None = None,
+        offpeak: OffPeakTimes | None = None,
     ) -> list[DailyUsageRead] | None:
         """Return the hourly reads of one day, or None if none are available.
 
@@ -244,7 +312,8 @@ class Gazdebordeaux:
         average power in kW over the half hour ending at its key, from 00:00
         of the day to 00:00 of the next one (49 points). Each point becomes
         kW x 0.5 h at the start of its half hour; the first one belongs to
-        the day before and is dropped.
+        the day before and is dropped. With off-peak ranges, each half hour
+        also goes to consumptionHp or consumptionHc.
 
         On the October change the day has 25 hours but the curve still has 49
         points: the naive keys of the repeated 02:00-03:00 hour collide and
@@ -297,6 +366,12 @@ class Gazdebordeaux:
                 ),
             )
             read.amountOfEnergy += energy
+            if offpeak is not None:
+                read.isHphc = True
+                if offpeak.is_offpeak(day, point.hour * 60 + point.minute):
+                    read.consumptionHc += energy
+                else:
+                    read.consumptionHp += energy
             read.volumeOfEnergy += value.get("volumeOfEnergy") or 0.0
             read.price += _price(value)
 
@@ -484,6 +559,13 @@ def _repeated_hour_halves(
     if share <= 0 or share > max(energy for _, energy, _ in halves):
         return []
     return [(p, share, {}) for p in missing]
+
+
+def _minutes(clock: str) -> int:
+    """Minutes since midnight of "H:MM"; "24:00" and "23:59" end the day."""
+    hours, minutes = (int(x) for x in clock.split(":")[:2])
+    total = hours * 60 + minutes
+    return 1440 if total >= 1439 else total
 
 
 def _energy(value: dict) -> float:

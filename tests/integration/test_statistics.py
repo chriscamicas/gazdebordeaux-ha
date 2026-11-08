@@ -36,6 +36,7 @@ from custom_components.gazdebordeaux.gazdebordeaux import (
     DailyUsageRead,
     Gazdebordeaux,
     HouseDetails,
+    OffPeakTimes,
     TotalUsageRead,
 )
 
@@ -387,7 +388,8 @@ def _paris_mean_time(read: DailyUsageRead) -> DailyUsageRead:
 
 
 def _store(coordinator: GdbCoordinator, energy: str, reads: list[DailyUsageRead]) -> None:
-    specs = ENERGY_STATISTICS[energy]
+    """Store `reads` as 1.2.0 did, without peak and off-peak series."""
+    specs = tuple(spec for spec in ENERGY_STATISTICS[energy] if not spec.peak_offpeak)
     coordinator._import_reads(specs, reads, {spec.statistic_id: 0.0 for spec in specs})
 
 
@@ -678,16 +680,27 @@ async def test_daily_sums_whatever_the_process_time_zone(
 DAY_PRICE = 2.4
 CONSUMPTION = f"{DOMAIN}:electricity_consumption"
 COST = f"{DOMAIN}:electricity_cost"
+HP = f"{DOMAIN}:electricity_consumption_hp"
+HC = f"{DOMAIN}:electricity_consumption_hc"
+COST_HC = f"{DOMAIN}:electricity_cost_hc"
+# A peak / off-peak day: 12 kWh, 0.25 kWh per half hour, 16 of them between
+# 22:00 and 6:00
+P_HP, P_HC, SUBSCRIPTION = 0.177, 0.137, 0.52
+HPHC_DAY_PRICE = 8 * P_HP + 4 * P_HC + SUBSCRIPTION
+OFFPEAK = OffPeakTimes(all=[["22:00", "6:00"]], high=[], low=[])
 
 
 class FakeApi(Gazdebordeaux):
     """Serve synthetic Life responses to the real parsing code."""
 
-    def __init__(self, hourly_start: date | None) -> None:
+    def __init__(self, hourly_start: date | None, offpeak: OffPeakTimes | None = None) -> None:
         super().__init__(None, "user@example.com", "secret", token="token")  # type: ignore[arg-type]
         self.today = datetime.now(PARIS).date()
         self.last_day = self.today - timedelta(days=2)
         self.hourly_start = hourly_start
+        # The house resource can lose its ranges; the daily reads keep their split
+        self.offpeak = offpeak
+        self.peak_offpeak_reads = offpeak is not None
         self.fail_hourly = False
         self.hourly_days: list[date] = []
         # Last day with a load curve; later days answer without points
@@ -697,10 +710,23 @@ class FakeApi(Gazdebordeaux):
         return None
 
     async def async_get_house_details(self, house: str) -> HouseDetails:
-        return HouseDetails(hourly_start=self.hourly_start)
+        return HouseDetails(hourly_start=self.hourly_start, offpeak=self.offpeak)
 
     def daily_payload(self, day: date) -> dict[str, Any]:
-        return {"kwh": 12.0, "price": DAY_PRICE, "volumeOfEnergy": 0, "ratio": 0}
+        if not self.peak_offpeak_reads:
+            return {"kwh": 12.0, "price": DAY_PRICE, "volumeOfEnergy": 0, "ratio": 0}
+        return {
+            "kwh": 12.0,
+            "price": HPHC_DAY_PRICE,
+            "volumeOfEnergy": 0,
+            "ratio": 0,
+            "isHphc": True,
+            "consumptionHp": 8.0,
+            "consumptionHc": 4.0,
+            "priceHp": 8 * P_HP,
+            "priceHc": 4 * P_HC,
+            "contractPrice": SUBSCRIPTION,
+        }
 
     async def async_get_data(self, house: str, start: Any, end: Any, scale: str) -> Any:
         if scale == "year":
@@ -966,7 +992,9 @@ async def test_hours_follow_the_monthly_points(hass: HomeAssistant, monkeypatch)
     coordinator = GdbCoordinator(hass, _electricity_entry(hass))
     asked = []
 
-    async def hours(self: Gazdebordeaux, house: str, day: date, daily_energy: float) -> list:
+    async def hours(
+        self: Gazdebordeaux, house: str, day: date, daily_energy: float, offpeak: Any
+    ) -> list:
         asked.append(day)
         return [
             DailyUsageRead(
@@ -997,3 +1025,126 @@ async def test_hours_follow_the_monthly_points(hass: HomeAssistant, monkeypatch)
     assert [len(days[date(2026, m, 1)]) for m in (8, 9, 10)] == [1, 1, 1]
     assert len(days[date(2026, 10, 5)]) == 24
     assert rows[-1]["sum"] == pytest.approx(1151.5)
+
+
+# ---------- peak / off-peak hours ------------------------------------------
+
+
+async def test_peak_and_offpeak_hour_by_hour(hass: HomeAssistant) -> None:
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=10), offpeak=OFFPEAK)
+    await _fake_coordinator(hass, api)._insert_statistics("electricity", ELEC)
+    days = _day_count(api)
+
+    assert (await _all_rows(hass, HC))[-1]["sum"] == pytest.approx(4.0 * days)
+    assert (await _all_rows(hass, HP))[-1]["sum"] == pytest.approx(8.0 * days)
+    assert (await _all_rows(hass, COST_HC))[-1]["sum"] == pytest.approx(4 * P_HC * days)
+    cost = await _all_rows(hass, COST)
+    assert cost[-1]["sum"] == pytest.approx(HPHC_DAY_PRICE * days)
+    # Each hour at its own rate, the subscription spread over the day's hours
+    noon = next(
+        r for r in _days(cost)[api.last_day] if datetime.fromtimestamp(r["start"], PARIS).hour == 12
+    )
+    assert noon["state"] == pytest.approx(0.5 * P_HP + SUBSCRIPTION / _hours_in(api.last_day))
+    # Days before the curve keep the daily split
+    first_day = _days(await _all_rows(hass, HC))[date(api.today.year - 1, 1, 1)]
+    assert [r["state"] for r in first_day] == [pytest.approx(4.0)]
+
+
+async def test_gas_and_base_contracts_get_no_peak_offpeak_series(hass: HomeAssistant) -> None:
+    api = FakeApi(hourly_start=None)
+    await _fake_coordinator(hass, api)._insert_statistics("electricity", ELEC)
+
+    assert await _all_rows(hass, CONSUMPTION)
+    assert not await _all_rows(hass, HC)
+
+
+async def test_missing_offpeak_ranges_skip_the_update(hass: HomeAssistant) -> None:
+    api = FakeApi(hourly_start=datetime.now(PARIS).date() - timedelta(days=5), offpeak=OFFPEAK)
+    coordinator = _fake_coordinator(hass, api)
+    await coordinator._insert_statistics("electricity", ELEC)
+    before = await _all_rows(hass, CONSUMPTION)
+
+    # One more day published, curve and all, but the house comes back
+    # without its ranges
+    api.last_day += timedelta(days=1)
+    api.hourly_until = api.last_day
+    api.offpeak = None
+    await coordinator._insert_statistics("electricity", ELEC)
+
+    assert (await _all_rows(hass, CONSUMPTION))[-1]["start"] == before[-1]["start"]
+    assert (await _all_rows(hass, HC))[-1]["start"] == before[-1]["start"]
+
+
+async def test_peak_offpeak_series_join_an_existing_series(hass: HomeAssistant) -> None:
+    """A series imported by 1.2.0 gets its peak and off-peak series, history and all."""
+    api = FakeApi(hourly_start=None, offpeak=OFFPEAK)
+    api.offpeak = None  # 1.2.0 didn't read the ranges
+    coordinator = _fake_coordinator(hass, api)
+    await coordinator._insert_statistics("electricity", ELEC)
+    await async_wait_recording_done(hass)
+    assert not await _all_rows(hass, HC)
+
+    api.offpeak = OFFPEAK
+    api.hourly_start = datetime.now(PARIS).date() - timedelta(days=5)
+    await coordinator._insert_statistics("electricity", ELEC)
+
+    days = _day_count(api)
+    assert (await _all_rows(hass, HC))[-1]["sum"] == pytest.approx(4.0 * days)
+    consumption = await _all_rows(hass, CONSUMPTION)
+    assert consumption[-1]["sum"] == pytest.approx(12.0 * days)
+    assert len(_days(consumption)[api.last_day]) == _hours_in(api.last_day)
+
+
+async def test_reset_after_the_contract_lost_its_ranges(hass: HomeAssistant) -> None:
+    entry = _electricity_entry(hass)
+    api = FakeApi(hourly_start=None, offpeak=OFFPEAK)
+    first = GdbCoordinator(hass, entry)
+    first.api = api
+    await first._insert_statistics("electricity", ELEC)
+    await async_wait_recording_done(hass)
+    assert await _all_rows(hass, HC)
+
+    # Now a base contract: updates are skipped until the statistics are reset
+    api.offpeak = None
+    coordinator = _reset_coordinator(hass, entry)
+    coordinator.api = api
+    await coordinator._insert_statistics("electricity", ELEC)
+    await async_wait_recording_done(hass)
+    assert not await _all_rows(hass, HC)
+
+    api.last_day += timedelta(days=1)
+    await coordinator._insert_statistics("electricity", ELEC)
+    consumption = await _all_rows(hass, CONSUMPTION)
+    assert consumption[-1]["sum"] == pytest.approx(12.0 * _day_count(api))
+
+
+async def test_the_remainder_on_the_1st_splits_peak_and_offpeak_too(hass: HomeAssistant) -> None:
+    coordinator = GdbCoordinator(hass, _electricity_entry(hass))
+
+    def split(read: DailyUsageRead, hp: float, hc: float) -> DailyUsageRead:
+        return dataclasses.replace(read, isHphc=True, consumptionHp=hp, consumptionHc=hc)
+
+    daily = [
+        split(_day(9, 1, 0, 0), 0, 0),
+        split(_day(10, 4, 0, 0), 0, 0),
+        split(_day(10, 5, 10, 2.0), 6, 4),
+        split(_day(10, 6, 12, 2.5), 7, 5),
+    ]
+    monthly = [
+        split(_month(2026, 9, 508, 101.7), 300, 208),
+        split(_month(2026, 10, 61, 13.0), 36, 25),
+    ]
+    with (
+        patch(f"{API}.async_get_daily_usage", new=AsyncMock(return_value=daily)),
+        patch(f"{API}.async_get_monthly_usage", new=AsyncMock(return_value=monthly)),
+        patch(
+            f"{API}.async_get_house_details",
+            new=AsyncMock(return_value=HouseDetails(hourly_start=None, offpeak=OFFPEAK)),
+        ),
+    ):
+        await coordinator._insert_statistics("electricity", ELEC)
+
+    hc = await _all_rows(hass, HC)
+    # September's figure, then October's remainder on the 1st and its days
+    assert [round(r["state"], 3) for r in hc] == [208, 16, 0, 4, 5]
+    assert hc[-1]["sum"] == pytest.approx(208 + 25)

@@ -102,6 +102,11 @@ def _subtract(total: DailyUsageRead, parts: list[DailyUsageRead]) -> DailyUsageR
         amountOfEnergy=total.amountOfEnergy - sum(p.amountOfEnergy for p in parts),
         volumeOfEnergy=total.volumeOfEnergy - sum(p.volumeOfEnergy for p in parts),
         price=total.price - sum(p.price for p in parts),
+        consumptionHp=total.consumptionHp - sum(p.consumptionHp for p in parts),
+        consumptionHc=total.consumptionHc - sum(p.consumptionHc for p in parts),
+        priceHp=total.priceHp - sum(p.priceHp for p in parts),
+        priceHc=total.priceHc - sum(p.priceHc for p in parts),
+        contractPrice=total.contractPrice - sum(p.contractPrice for p in parts),
     )
 
 
@@ -139,6 +144,8 @@ class StatisticSpec:
     unit_class: str | None
     unit: str
     value_fn: Callable[[DailyUsageRead], float]
+    # Only written for contracts with off-peak ranges
+    peak_offpeak: bool = False
 
 
 # The first spec of each energy is the one used to find the last imported day.
@@ -182,6 +189,39 @@ ENERGY_STATISTICS: dict[str, tuple[StatisticSpec, ...]] = {
             None,
             CURRENCY_EURO,
             lambda read: read.price,
+        ),
+        StatisticSpec(
+            f"{DOMAIN}:electricity_consumption_hp",
+            "Gaz de Bordeaux electricity peak consumption",
+            "energy",
+            UnitOfEnergy.KILO_WATT_HOUR,
+            lambda read: read.consumptionHp,
+            peak_offpeak=True,
+        ),
+        StatisticSpec(
+            f"{DOMAIN}:electricity_consumption_hc",
+            "Gaz de Bordeaux electricity off-peak consumption",
+            "energy",
+            UnitOfEnergy.KILO_WATT_HOUR,
+            lambda read: read.consumptionHc,
+            peak_offpeak=True,
+        ),
+        # Without the subscription, which stays in electricity_cost only
+        StatisticSpec(
+            f"{DOMAIN}:electricity_cost_hp",
+            "Gaz de Bordeaux electricity peak cost",
+            None,
+            CURRENCY_EURO,
+            lambda read: read.priceHp,
+            peak_offpeak=True,
+        ),
+        StatisticSpec(
+            f"{DOMAIN}:electricity_cost_hc",
+            "Gaz de Bordeaux electricity off-peak cost",
+            None,
+            CURRENCY_EURO,
+            lambda read: read.priceHc,
+            peak_offpeak=True,
         ),
     ),
 }
@@ -294,10 +334,9 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
 
     async def _insert_statistics(self, energy: str, house: str) -> None:
         """Insert gdb statistics for one energy type."""
-        specs = ENERGY_STATISTICS[energy]
-        statistic_ids = {spec.statistic_id for spec in specs}
-        anchor_statistic_id = specs[0].statistic_id
-        _LOGGER.debug("Updating Statistics for %s", ", ".join(sorted(statistic_ids)))
+        all_specs = ENERGY_STATISTICS[energy]
+        anchor_statistic_id = all_specs[0].statistic_id
+        _LOGGER.debug("Updating Statistics for %s", anchor_statistic_id)
 
         last_stats = await get_instance(self.hass).async_add_executor_job(
             get_last_statistics, self.hass, 2, anchor_statistic_id, True, set()
@@ -305,24 +344,35 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         # Newest first.
         last_rows = last_stats.get(anchor_statistic_id, [])
         details = await self._async_get_house_details(house)
-        hourly_from = _first_hourly_day(details.hourly_start)
+        specs = tuple(s for s in all_specs if details.offpeak is not None or not s.peak_offpeak)
+        has_peak_offpeak = await self._async_has_peak_offpeak(all_specs)
 
-        if energy in self._reset_pending:
-            # The "reset statistics" option
+        if rebuild := self._rebuild_reason(energy, bool(last_rows), details, has_peak_offpeak):
             since = await self._async_get_first_day(anchor_statistic_id)
             await self._insert_full_history(
                 specs,
                 house,
                 await self._async_get_all_data(house, since),
-                hourly_from,
-                rebuild="on request",
+                details,
+                rebuild=rebuild,
+                cleared=all_specs,
             )
             self._reset_pending.discard(energy)
             return
 
+        if last_rows and details.offpeak is None and has_peak_offpeak:
+            # Writing the other series alone would leave a hole in the peak
+            # and off-peak ones for good: wait for the ranges to come back
+            _LOGGER.warning(
+                "No off-peak ranges for %s; skipping the update to keep the peak and "
+                "off-peak statistics whole (reset the statistics if the contract changed)",
+                house,
+            )
+            return
+
         if last_rows and not _is_whole_hour(float(last_rows[0]["start"])):
             # The next update goes on from the moved points
-            await self._move_to_whole_hours(specs)
+            await self._move_to_whole_hours(all_specs)
             return
 
         if last_rows and _is_monthly_series(last_rows):
@@ -337,27 +387,46 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             # on daily reporting). Continuing from the last monthly point would
             # count its month twice: rebuild the series from scratch instead.
             await self._insert_full_history(
-                specs, house, all_reads, hourly_from, rebuild="now that daily data is available"
+                specs,
+                house,
+                all_reads,
+                details,
+                rebuild="now that daily data is available",
+                cleared=all_specs,
             )
             return
 
         if not last_rows:
             _LOGGER.debug("Updating statistic for the first time")
             await self._insert_full_history(
-                specs, house, await self._async_get_all_data(house), hourly_from
+                specs, house, await self._async_get_all_data(house), details
             )
             return
 
-        await self._insert_recent_reads(
-            specs, house, cast(float, last_rows[0]["start"]), hourly_from
-        )
+        await self._insert_recent_reads(specs, house, cast(float, last_rows[0]["start"]), details)
+
+    def _rebuild_reason(
+        self, energy: str, has_rows: bool, details: HouseDetails, has_peak_offpeak: bool
+    ) -> str | None:
+        """Why the statistics of `energy` must be imported again, if they must."""
+        if energy in self._reset_pending:
+            # The "reset statistics" option
+            return "on request"
+        if (
+            has_rows
+            and details.offpeak is not None
+            and not has_peak_offpeak
+            and any(spec.peak_offpeak for spec in ENERGY_STATISTICS[energy])
+        ):
+            return "with peak and off-peak series"
+        return None
 
     async def _insert_recent_reads(
         self,
         specs: tuple[StatisticSpec, ...],
         house: str,
         last_stat_ts: float,
-        hourly_from: date,
+        details: HouseDetails,
     ) -> None:
         """Add the reads after the last imported point, on top of its sums."""
         statistic_ids = {spec.statistic_id for spec in specs}
@@ -388,34 +457,36 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
                 continue
             new_reads.append(usage_read)
 
-        self._import_reads(
-            specs, await self._with_hourly_reads(house, new_reads, hourly_from), sums
-        )
+        self._import_reads(specs, await self._with_hourly_reads(house, new_reads, details), sums)
 
     async def _insert_full_history(
         self,
         specs: tuple[StatisticSpec, ...],
         house: str,
         daily_reads: list[DailyUsageRead],
-        hourly_from: date,
+        details: HouseDetails,
+        *,
         rebuild: str | None = None,
+        cleared: tuple[StatisticSpec, ...] = (),
     ) -> None:
         """Import the whole history into empty statistics, or in place of them.
 
-        Days from hourly_from on are imported hour by hour. When rebuilding,
-        the existing statistics are only cleared once all the new data is
+        Days covered by the load curve are imported hour by hour. When
+        rebuilding, the existing statistics, and those of `cleared` that the
+        contract no longer feeds, are only cleared once all the new data is
         downloaded: a failure on the way leaves them untouched.
         """
         reads = await self._full_history_reads(house, daily_reads)
-        reads = await self._with_hourly_reads(house, reads, hourly_from)
+        reads = await self._with_hourly_reads(house, reads, details)
         statistic_ids = sorted({spec.statistic_id for spec in specs})
         if rebuild:
             if not _has_usage(reads):
                 # Treated like a failed download: keep what is there
                 raise Exception(f"No usage to rebuild {', '.join(statistic_ids)} with")
-            _LOGGER.info("Rebuilding %s %s", ", ".join(statistic_ids), rebuild)
+            cleared_ids = sorted({spec.statistic_id for spec in (*specs, *cleared)})
+            _LOGGER.info("Rebuilding %s %s", ", ".join(cleared_ids), rebuild)
             # The recorder runs the clear before the imports queued after it
-            get_instance(self.hass).async_clear_statistics(statistic_ids)
+            get_instance(self.hass).async_clear_statistics(cleared_ids)
         self._import_reads(specs, reads, dict.fromkeys(statistic_ids, 0.0))
 
     async def _full_history_reads(
@@ -471,15 +542,17 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         return before + daily_from
 
     async def _with_hourly_reads(
-        self, house: str, reads: list[DailyUsageRead], hourly_from: date
+        self, house: str, reads: list[DailyUsageRead], details: HouseDetails
     ) -> list[DailyUsageRead]:
-        """Replace the daily reads from hourly_from on by hourly reads.
+        """Replace the daily reads the load curve covers by hourly reads.
 
         Monthly points stay as they are. A day whose hours do not add up to
         its daily read keeps the daily read. A recent day without hours yet
         stops the import there, so the next update picks it up hour by hour
         once Enedis has published it.
         """
+        hourly_from = _first_hourly_day(details.hourly_start)
+        offpeak = details.offpeak
         result: list[DailyUsageRead] = []
         recent = datetime.now(paris_tz).date() - timedelta(days=HOURLY_GRACE_DAYS)
         requested = False
@@ -491,7 +564,9 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             if requested:
                 await asyncio.sleep(HOURLY_REQUEST_DELAY)
             requested = True
-            hourly = await self.api.async_get_hourly_usage(house, day, daily.amountOfEnergy)
+            hourly = await self.api.async_get_hourly_usage(
+                house, day, daily.amountOfEnergy, offpeak if daily.isHphc else None
+            )
             if not hourly:
                 if day >= recent:
                     _LOGGER.debug("No hourly data yet for %s, waiting for it", day)
@@ -509,6 +584,10 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
                     daily.amountOfEnergy,
                 )
                 result.append(daily)
+                continue
+            if daily.isHphc and offpeak is not None:
+                _split_peak_offpeak(day, daily, hourly)
+                result.extend(hourly)
                 continue
             # The hours carry no cost, nor any gas volume: spread the day's by
             # consumption, or evenly over a day without any (it still costs
@@ -603,6 +682,16 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             # Without it, the import goes on daily, as before this resource was read
             _LOGGER.warning("Could not read the house details", exc_info=True)
             return HouseDetails(hourly_start=None)
+
+    async def _async_has_peak_offpeak(self, specs: tuple[StatisticSpec, ...]) -> bool:
+        """Whether the peak and off-peak series among `specs` have points."""
+        statistic_id = next((spec.statistic_id for spec in specs if spec.peak_offpeak), None)
+        if statistic_id is None:
+            return False
+        last = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, True, set()
+        )
+        return bool(last.get(statistic_id))
 
     async def _async_get_last_sums(self, statistic_ids: set[str]) -> dict[str, float]:
         """Each statistic's running sum at its last point (0 if none).
@@ -717,3 +806,35 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             datetime.fromtimestamp(last_stat_time, paris_tz),
             datetime.now(paris_tz),
         )
+
+
+def _split_peak_offpeak(day: date, daily: DailyUsageRead, hourly: list[DailyUsageRead]) -> None:
+    """Price each hour at its own peak / off-peak rate.
+
+    The hours are already split by the contract's off-peak ranges; that split
+    must match the daily one. Each period's daily cost is then spread over
+    its own kWh, and the subscription evenly over the hours, so that the day
+    adds up exactly to the daily read.
+    """
+    offpeak_energy = sum(r.consumptionHc for r in hourly)
+    if abs(offpeak_energy - daily.consumptionHc) > 0.1 * daily.consumptionHc + 0.1:
+        _LOGGER.warning(
+            "Off-peak hours of %s add up to %.3f kWh, daily read says %.3f: "
+            "splitting each hour by the daily ratio",
+            day,
+            offpeak_energy,
+            daily.consumptionHc,
+        )
+        share = daily.consumptionHc / daily.amountOfEnergy if daily.amountOfEnergy else 0.0
+        for r in hourly:
+            r.consumptionHc = r.amountOfEnergy * share
+            r.consumptionHp = r.amountOfEnergy - r.consumptionHc
+    peak_energy = sum(r.consumptionHp for r in hourly)
+    offpeak_energy = sum(r.consumptionHc for r in hourly)
+    subscription = daily.contractPrice / len(hourly)
+    for r in hourly:
+        r.isHphc = True
+        r.priceHp = daily.priceHp * r.consumptionHp / peak_energy if peak_energy else 0.0
+        r.priceHc = daily.priceHc * r.consumptionHc / offpeak_energy if offpeak_energy else 0.0
+        r.contractPrice = subscription
+        r.price = r.priceHp + r.priceHc + subscription

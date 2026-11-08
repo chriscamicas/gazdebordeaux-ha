@@ -26,6 +26,7 @@ from gazdebordeaux import (
     LOGIN_URL,
     ME_URL,
     Gazdebordeaux,
+    OffPeakTimes,
 )
 
 USERNAME = "user@example.com"
@@ -260,6 +261,22 @@ async def test_hourly_usage_turns_power_into_hourly_energy(http_mock, session):
     assert all(abs(h.amountOfEnergy - 0.5) < 1e-9 for h in hours)
 
 
+async def test_hourly_usage_splits_peak_and_offpeak(http_mock, session):
+    day = date(2026, 10, 20)
+    http_mock.get(DAY_URL, payload=_curve(day))
+    offpeak = OffPeakTimes(all=[["22:00", "6:00"]], high=[], low=[])
+
+    api = Gazdebordeaux(session, USERNAME, PASSWORD, token=TOKEN)
+    hours = await api.async_get_hourly_usage(HOUSE_PATH, day, offpeak=offpeak)
+
+    assert hours is not None
+    by_hour = {h.date.hour: h for h in hours}
+    assert abs(by_hour[5].consumptionHc - 0.5) < 1e-9 and by_hour[5].consumptionHp == 0
+    assert abs(by_hour[6].consumptionHp - 0.5) < 1e-9 and by_hour[6].consumptionHc == 0
+    assert abs(by_hour[23].consumptionHc - 0.5) < 1e-9
+    assert abs(sum(h.consumptionHc for h in hours) - 4.0) < 1e-9
+
+
 async def test_hourly_usage_october_change_keeps_hours_distinct(http_mock, session):
     # 2026-10-25: clocks go back at 03:00; the naive keys cannot repeat
     # 02:00-03:00, but no hour may be counted twice
@@ -285,16 +302,20 @@ async def test_hourly_usage_october_change_fills_the_lost_half_hours(http_mock, 
     day = date(2026, 10, 25)
     http_mock.get(DAY_URL, payload=_curve(day))
 
+    offpeak = OffPeakTimes(all=[["1:00", "6:00"]], high=[], low=[])
+
     api = Gazdebordeaux(session, USERNAME, PASSWORD, token=TOKEN)
-    hours = await api.async_get_hourly_usage(HOUSE_PATH, day, daily_energy=12.5)
+    hours = await api.async_get_hourly_usage(HOUSE_PATH, day, daily_energy=12.5, offpeak=offpeak)
 
     assert hours is not None
     assert len({h.date.timestamp() for h in hours}) == len(hours) == 25
     assert all(abs(h.amountOfEnergy - 0.5) < 1e-9 for h in hours)
-    assert [h.date.isoformat() for h in hours if h.date.hour == 2] == [
+    two_am = [h for h in hours if h.date.hour == 2]
+    assert [h.date.isoformat() for h in two_am] == [
         "2026-10-25T02:00:00+02:00",
         "2026-10-25T02:00:00+01:00",
     ]
+    assert all(abs(h.consumptionHc - 0.5) < 1e-9 for h in two_am)
 
 
 @pytest.mark.parametrize(
@@ -341,22 +362,91 @@ async def test_hourly_usage_rejects_daily_keys(http_mock, session):
 # ---------- async_get_house_details ----------------------------------------
 
 
-async def test_house_details_reads_the_curve_start(http_mock, session):
+async def test_house_details_reads_seasonal_offpeak_and_curve_start(http_mock, session):
     http_mock.get(
         f"{DATA_HOST}{HOUSE_PATH}",
-        payload={"priceCategory": "BASE", "hourlyMeasureStartDate": "2026-02-24T00:00:00+01:00"},
+        payload={
+            "priceCategory": "HPHC",
+            "offPeakTimes": [],
+            "offPeakTimesHighSeason": [["2:00", "7:00"], ["22:00", "0:00"]],
+            "offPeakTimesLowSeason": [["1:00", "6:00"], ["14:00", "17:00"]],
+            "hourlyMeasureStartDate": "2026-02-24T00:00:00+01:00",
+        },
     )
 
     api = Gazdebordeaux(session, USERNAME, PASSWORD, token=TOKEN)
     details = await api.async_get_house_details("/houses/abc")
 
     assert details.hourly_start == date(2026, 2, 24)
+    assert details.offpeak is not None
+    assert details.offpeak.is_offpeak(date(2026, 12, 1), 23 * 60 + 30)
+    assert not details.offpeak.is_offpeak(date(2026, 12, 1), 15 * 60)
+    assert details.offpeak.is_offpeak(date(2026, 7, 1), 15 * 60)
 
 
-async def test_house_details_without_curve(http_mock, session):
+async def test_house_details_base_contract(http_mock, session):
     http_mock.get(f"{DATA_HOST}{HOUSE_PATH}", payload={"priceCategory": "BASE"})
 
     api = Gazdebordeaux(session, USERNAME, PASSWORD, token=TOKEN)
     details = await api.async_get_house_details(HOUSE_PATH)
 
+    assert details.offpeak is None
     assert details.hourly_start is None
+
+
+def test_offpeak_ranges_ending_at_midnight():
+    offpeak = OffPeakTimes(all=[["22:00", "24:00"], ["0:00", "6:00"]], high=[], low=[])
+    day = date(2026, 7, 1)
+    assert offpeak.is_offpeak(day, 23 * 60 + 30)
+    assert offpeak.is_offpeak(day, 0)
+    assert not offpeak.is_offpeak(day, 6 * 60)
+    # 23:59 ends the day too
+    late = OffPeakTimes(all=[["22:00", "23:59"]], high=[], low=[])
+    assert late.is_offpeak(day, 23 * 60 + 59)
+
+
+# ---------- async_get_daily_usage: HP/HC fields ----------------------------
+
+
+async def test_daily_usage_reads_peak_offpeak_and_fills_zero_days(http_mock, session):
+    base = {"volumeOfEnergy": 0, "ratio": 0, "temperature": 12, "isHphc": True}
+    http_mock.get(
+        re.compile(re.escape(DATA_URL.format(HOUSE_PATH)) + r"\?.*scale=month.*"),
+        payload={
+            "2026-02-24": {
+                **base,
+                "kwh": 0,
+                "price": 0,
+                "consumptionHp": 1.0,
+                "consumptionHc": 3.0,
+                "priceHp": 0.18,
+                "priceHc": 0.41,
+                "contractPrice": 0.52,
+            },
+            "2026-10-20": {
+                **base,
+                "kwh": 9.705,
+                "price": 2.04,
+                "consumptionHp": 4.863,
+                "consumptionHc": 4.842,
+                "priceHp": 0.86,
+                "priceHc": 0.66,
+                "contractPrice": 0.52,
+            },
+            "total": {},
+        },
+    )
+
+    api = Gazdebordeaux(session, USERNAME, PASSWORD, token=TOKEN)
+    reads = {
+        r.date.date().isoformat(): r
+        for r in await api.async_get_daily_usage(
+            HOUSE_PATH, datetime(2026, 1, 1), datetime(2026, 10, 22)
+        )
+    }
+
+    assert reads["2026-10-20"].consumptionHc == 4.842
+    assert reads["2026-10-20"].contractPrice == 0.52
+    # kwh and price at 0 while the periods are filled: the periods win
+    assert reads["2026-02-24"].amountOfEnergy == 4.0
+    assert abs(reads["2026-02-24"].price - 1.11) < 1e-9
