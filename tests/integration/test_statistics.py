@@ -6,6 +6,7 @@ import dataclasses
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
+import pytest
 import pytz
 from homeassistant.components.recorder.statistics import (
     list_statistic_ids,
@@ -23,12 +24,14 @@ from custom_components.gazdebordeaux.const import (
     CONF_GAS_HOUSE,
     DOMAIN,
     NONE,
+    RESET_STATISTICS,
 )
 from custom_components.gazdebordeaux.coordinator import ENERGY_STATISTICS, GdbCoordinator
 from custom_components.gazdebordeaux.gazdebordeaux import DailyUsageRead
 
 ELEC = "/api/houses/elec-uuid"
 GAS = "/api/houses/gas-uuid"
+API = "custom_components.gazdebordeaux.coordinator.Gazdebordeaux"
 PARIS = pytz.timezone("Europe/Paris")
 
 
@@ -431,3 +434,99 @@ async def test_paris_mean_time_monthly_series_moves_and_stays_monthly(
         (749, 1408),
         (829, 2237),
     ]
+
+
+def _reset_coordinator(hass: HomeAssistant, entry: MockConfigEntry) -> GdbCoordinator:
+    """A coordinator set up after the "reset statistics" option was saved."""
+    hass.config_entries.async_update_entry(entry, data={**entry.data, RESET_STATISTICS: True})
+    coordinator = GdbCoordinator(hass, entry)
+    assert entry.data[RESET_STATISTICS] is False
+    return coordinator
+
+
+async def test_reset_imports_everything_again(hass: HomeAssistant) -> None:
+    entry = _electricity_entry(hass)
+    daily = AsyncMock(return_value=[_read(1, 10, 2.0), _read(2, 5, 1.0)])
+    with patch(f"{API}.async_get_daily_usage", new=daily):
+        await GdbCoordinator(hass, entry)._insert_statistics("electricity", ELEC)
+        await async_wait_recording_done(hass)
+
+        # Life corrected the 1st since; the 3rd came out
+        daily.return_value = [_read(1, 12, 2.4), _read(2, 5, 1.0), _read(3, 7, 1.5)]
+        coordinator = _reset_coordinator(hass, entry)
+        await coordinator._insert_statistics("electricity", ELEC)
+        await async_wait_recording_done(hass)
+        rows = await _hourly_rows(hass, f"{DOMAIN}:electricity_consumption")
+        assert [(r["state"], r["sum"]) for r in rows] == [(12, 12), (5, 17), (7, 24)]
+        assert not coordinator._reset_pending
+
+        # Done once: the next update only adds the new day
+        daily.return_value = [_read(3, 7, 1.5), _read(4, 6, 1.2)]
+        await coordinator._insert_statistics("electricity", ELEC)
+        await async_wait_recording_done(hass)
+
+    rows = await _hourly_rows(hass, f"{DOMAIN}:electricity_consumption")
+    assert [r["sum"] for r in rows] == [12, 17, 24, 30]
+
+
+@pytest.mark.parametrize("failure", ["monthly download fails", "nothing comes back"])
+async def test_failed_rebuild_keeps_the_statistics(hass: HomeAssistant, failure: str) -> None:
+    entry = _electricity_entry(hass)
+    daily = AsyncMock(return_value=DAILY_SINCE_OCTOBER)
+    monthly = AsyncMock(return_value=MONTHLY_SINCE_AUGUST)
+    with (
+        patch(f"{API}.async_get_daily_usage", new=daily),
+        patch(f"{API}.async_get_monthly_usage", new=monthly),
+    ):
+        await GdbCoordinator(hass, entry)._insert_statistics("electricity", ELEC)
+        await async_wait_recording_done(hass)
+        await _assert_hybrid(hass)
+
+        coordinator = _reset_coordinator(hass, entry)
+        if failure == "monthly download fails":
+            monthly.side_effect = Exception("Data response was not JSON (status=403)")
+        else:
+            daily.return_value = []
+            monthly.return_value = []
+        with pytest.raises(Exception, match=r"not JSON|No usage to rebuild"):
+            await coordinator._insert_statistics("electricity", ELEC)
+        await async_wait_recording_done(hass)
+
+    # The rebuild downloads everything before clearing anything
+    await _assert_hybrid(hass)
+    assert coordinator._reset_pending == {"electricity"}
+
+
+async def test_rebuild_reaches_back_to_the_oldest_point(hass: HomeAssistant) -> None:
+    """Days older than the first import's range are asked again, not dropped."""
+    entry = _gas_entry(hass)
+    old_day = dataclasses.replace(_read(1, 10, 2.0), date=PARIS.localize(datetime(2023, 3, 15)))
+    _store(GdbCoordinator(hass, entry), "gas", [old_day, _read(1, 5, 1.0)])
+    await async_wait_recording_done(hass)
+
+    coordinator = _reset_coordinator(hass, entry)
+    daily = AsyncMock(return_value=[old_day, _read(1, 5, 1.0)])
+    with patch(f"{API}.async_get_daily_usage", new=daily):
+        await coordinator._insert_statistics("gas", GAS)
+        await async_wait_recording_done(hass)
+
+    start = daily.await_args.args[1]
+    assert (start.year, start.month) == (2023, 3)
+    rows = await _hourly_rows(hass, f"{DOMAIN}:energy_consumption", datetime(2023, 1, 1))
+    assert [r["sum"] for r in rows] == [10, 15]
+
+
+async def test_reset_on_an_empty_database_runs_once(hass: HomeAssistant) -> None:
+    coordinator = _reset_coordinator(hass, _electricity_entry(hass))
+    daily = AsyncMock(return_value=[_read(1, 10, 2.0), _read(2, 5, 1.0)])
+    with patch(f"{API}.async_get_daily_usage", new=daily):
+        await coordinator._insert_statistics("electricity", ELEC)
+        await async_wait_recording_done(hass)
+        assert not coordinator._reset_pending
+
+        await coordinator._insert_statistics("electricity", ELEC)
+        await async_wait_recording_done(hass)
+
+    # The second update asks from the last imported day, not the whole history
+    start = daily.await_args.args[1]
+    assert (start.month, start.day) == (9, 2)
