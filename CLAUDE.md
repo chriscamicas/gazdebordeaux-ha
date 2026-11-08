@@ -79,7 +79,7 @@ The coordinator runs every 12h but the JWT expires sooner, so `_async_update_dat
 
 ### Statistics import runs in the background
 
-`_async_update_data` fetches the totals for the sensors, starts `_async_insert_statistics_logged` as a background task (one at a time) and returns. A failure on one energy is logged and retried at the next update, without stopping the other one. Tests that drive `_async_update_data` must wait with `hass.async_block_till_done(wait_background_tasks=True)`.
+`_async_update_data` fetches the totals for the sensors, starts `_async_insert_statistics_logged` as a background task of the config entry (one at a time; unloading the entry, as a reload does, cancels it) and returns. A failure on one energy is logged and retried at the next update, without stopping the other one. Tests that drive `_async_update_data` must wait with `hass.async_block_till_done(wait_background_tasks=True)`.
 
 ## Local testing
 

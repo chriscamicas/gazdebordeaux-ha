@@ -174,6 +174,7 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=entry,
             name="gazdebordeaux",
             # Data is updated daily.
             # Refresh every 12h to be at most 12h behind.
@@ -184,6 +185,7 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         self.last_update: datetime | None = None
         # Statistics import running in the background, see _async_update_data
         self._statistics_task: asyncio.Task | None = None
+        self._entry = entry
 
         entry_data = entry.data
 
@@ -242,9 +244,11 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         # we need to insert data into statistics. That runs in the background,
         # so that a slow or failing import (a rebuild, Life's edge filter)
         # holds neither the config entry setup, which Home Assistant cancels
-        # after a while, nor the sensors.
+        # after a while, nor the sensors. Unloading the entry, as a reload
+        # does, cancels it: the next coordinator starts its own.
         if self._statistics_task is None or self._statistics_task.done():
-            self._statistics_task = self.hass.async_create_background_task(
+            self._statistics_task = self._entry.async_create_background_task(
+                self.hass,
                 self._async_insert_statistics_logged(dict(self.houses)),
                 "gazdebordeaux statistics import",
             )

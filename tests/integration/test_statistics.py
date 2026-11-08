@@ -562,6 +562,30 @@ async def test_setup_does_not_wait_for_the_statistics_import(hass: HomeAssistant
     assert imported == ["gas"]
 
 
+async def test_unloading_the_entry_cancels_the_import(hass: HomeAssistant) -> None:
+    # A reload (saving the options) must not leave the old import running
+    # next to the new coordinator's one
+    entry = _gas_entry(hass)
+    started = asyncio.Event()
+
+    async def endless_import(self: GdbCoordinator, energy: str, house: str) -> None:
+        started.set()
+        await asyncio.sleep(3600)
+
+    total = TotalUsageRead(amountOfEnergy=1.0, volumeOfEnergy=0.0, price=1.0)
+    with (
+        patch(f"{API}.async_login", new=AsyncMock(return_value=None)),
+        patch(f"{API}.async_get_total_usage", new=AsyncMock(return_value=total)),
+        patch.object(GdbCoordinator, "_insert_statistics", new=endless_import),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await asyncio.wait_for(started.wait(), 5)
+        task = hass.data[DOMAIN][entry.entry_id]._statistics_task
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+    assert task.cancelled()
+
+
 async def test_failed_import_keeps_the_totals_and_the_other_energy(hass: HomeAssistant) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN,
