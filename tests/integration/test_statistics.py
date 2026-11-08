@@ -535,7 +535,10 @@ async def test_rebuild_reaches_back_to_the_oldest_point(hass: HomeAssistant) -> 
 
     coordinator = _reset_coordinator(hass, entry)
     daily = AsyncMock(return_value=[old_day, _read(1, 5, 1.0)])
-    with patch(f"{API}.async_get_daily_usage", new=daily):
+    with (
+        patch(f"{API}.async_get_daily_usage", new=daily),
+        patch(f"{API}.async_get_monthly_usage", new=AsyncMock(return_value=[])),
+    ):
         await coordinator._insert_statistics("gas", GAS)
         await async_wait_recording_done(hass)
 
@@ -1215,3 +1218,47 @@ async def test_any_energy_waiting_sets_the_pace(hass: HomeAssistant) -> None:
     # Electricity still waits for the day Life should publish next
     coordinator._last_days[CONSUMPTION] = expected - timedelta(days=1)
     assert coordinator._next_update_interval() == WAITING_UPDATE_INTERVAL
+
+
+# ---------- monthly figures ------------------------------------------------
+
+
+async def test_full_import_reaches_the_monthly_figures(hass: HomeAssistant) -> None:
+    """Days without what Life counts in its months get it on the month's first day."""
+    # The first days of a contract, without the subscription their month counts
+    daily = [
+        _day(2, 1, 0, 0),
+        _day(2, 24, 3, 0.41),
+        _day(2, 25, 4, 0.59),
+        _day(3, 1, 16, 2.58),
+        _day(3, 2, 16, 2.58),
+        _day(3, 3, 0, 0),
+        _day(4, 1, 10, 2.0),
+    ]
+    monthly = [_month(2026, 2, 7, 4.42), _month(2026, 3, 32, 6.72), _month(2026, 4, 25, 6.0)]
+    coordinator = GdbCoordinator(hass, _electricity_entry(hass))
+    with (
+        patch(f"{API}.async_get_daily_usage", new=AsyncMock(return_value=daily)),
+        patch(f"{API}.async_get_monthly_usage", new=AsyncMock(return_value=monthly)),
+    ):
+        await coordinator._insert_statistics("electricity", ELEC)
+
+    cost = await _all_rows(hass, COST)
+    # April is the last month: its days may still come, it stays as it is
+    assert [round(r["state"], 2) for r in cost] == [3.42, 0.41, 0.59, 4.14, 2.58, 0, 2.0]
+    assert [r["state"] for r in await _all_rows(hass, CONSUMPTION)] == [0, 3, 4, 16, 16, 0, 10]
+
+
+async def test_rounding_and_extra_reads_leave_a_month_alone(hass: HomeAssistant) -> None:
+    daily = [_day(2, 1, 5, 1.0), _day(3, 1, 5, 1.0), _day(4, 1, 5, 1.0)]
+    # February lacks a cent; March lacks 0.50 EUR but its day is above its kWh
+    monthly = [_month(2026, 2, 5, 1.01), _month(2026, 3, 4, 1.5), _month(2026, 4, 5, 1.0)]
+    coordinator = GdbCoordinator(hass, _electricity_entry(hass))
+    with (
+        patch(f"{API}.async_get_daily_usage", new=AsyncMock(return_value=daily)),
+        patch(f"{API}.async_get_monthly_usage", new=AsyncMock(return_value=monthly)),
+    ):
+        await coordinator._insert_statistics("electricity", ELEC)
+
+    assert [round(r["state"], 2) for r in await _all_rows(hass, COST)] == [1.0, 1.5, 1.0]
+    assert [r["state"] for r in await _all_rows(hass, CONSUMPTION)] == [5, 5, 5]

@@ -62,6 +62,8 @@ The house resource of an HP/HC contract has `priceCategory: "HPHC"` and its off-
 
 The peak and off-peak series (`peak_offpeak` specs) are only written for contracts with ranges. An existing series without them is rebuilt once to add them. When the house comes back without ranges while they exist, the update is skipped, so that they don't get a hole for good; a reset clears every series of the energy, which is the way out after a contract change.
 
+On the tested account, the first days of the contract come with `kwh` and `price` at 0 and no `contractPrice`, while the monthly `scale=year` figures count their subscription (about 1 % of the total). On a full import, `_async_get_month_remainders` compares each month the daily reads cover to the end with its monthly figure and adds what lacks, beyond rounding (`MONTH_ROUNDING`), to the month's first read. An excess is never subtracted, and the month of the last read is left alone since its days can still come.
+
 ### Config entry shape (version 2)
 
 `username`, `password`, `reset_stats`, `gas_house`, `electricity_house`. Each house value is a normalized `/api/houses/{uuid}` path, `"none"`, or (gas only, from migration) `"auto"`. The house selectors are `vol.Required` with an explicit `"none"` option, which sidesteps the Optional-default pitfall below.

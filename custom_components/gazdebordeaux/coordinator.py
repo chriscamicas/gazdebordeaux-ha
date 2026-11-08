@@ -57,6 +57,8 @@ HOURLY_MAX_DAYS = 730
 HOURLY_REQUEST_DELAY = 0.2
 # Hourly data of the last days may not be published yet: wait for it
 HOURLY_GRACE_DAYS = 3
+# A month's daily reads may miss its monthly figure by rounding (kWh or EUR)
+MONTH_ROUNDING = 0.05
 # Life publishes each day's reads two days later, during the day
 PUBLICATION_DELAY = timedelta(days=2)
 # Usual pace, and the one while the day Life should publish next is missing
@@ -113,6 +115,32 @@ def _subtract(total: DailyUsageRead, parts: list[DailyUsageRead]) -> DailyUsageR
         priceHc=total.priceHc - sum(p.priceHc for p in parts),
         contractPrice=total.contractPrice - sum(p.contractPrice for p in parts),
     )
+
+
+# Fields of a read that a month's remainder adds to
+_REMAINDER_FIELDS = (
+    "amountOfEnergy",
+    "volumeOfEnergy",
+    "price",
+    "consumptionHp",
+    "consumptionHc",
+    "priceHp",
+    "priceHc",
+    "contractPrice",
+)
+
+
+def _add_month_remainders(
+    reads: list[DailyUsageRead], remainders: dict[tuple[int, int], DailyUsageRead]
+) -> None:
+    """Add each month's remainder to its first read; only what lacks, field by field."""
+    pending = dict(remainders)
+    for read in reads:
+        remainder = pending.pop(_month_of(read), None)
+        if remainder is None:
+            continue
+        for field in _REMAINDER_FIELDS:
+            setattr(read, field, getattr(read, field) + max(getattr(remainder, field), 0.0))
 
 
 def _is_monthly_series(last_rows: list) -> bool:
@@ -484,13 +512,16 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
     ) -> None:
         """Import the whole history into empty statistics, or in place of them.
 
-        Days covered by the load curve are imported hour by hour. When
-        rebuilding, the existing statistics, and those of `cleared` that the
-        contract no longer feeds, are only cleared once all the new data is
-        downloaded: a failure on the way leaves them untouched.
+        Days covered by the load curve are imported hour by hour, and each
+        past month is brought up to Life's monthly figure. When rebuilding,
+        the existing statistics, and those of `cleared` that the contract no
+        longer feeds, are only cleared once all the new data is downloaded:
+        a failure on the way leaves them untouched.
         """
         reads = await self._full_history_reads(house, daily_reads)
+        remainders = await self._async_get_month_remainders(house, reads)
         reads = await self._with_hourly_reads(house, reads, details)
+        _add_month_remainders(reads, remainders)
         statistic_ids = sorted({spec.statistic_id for spec in specs})
         if rebuild:
             if not _has_usage(reads):
@@ -553,6 +584,44 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             daily_from = [read for read in daily_from if read.date != transition.date]
             daily_from.insert(0, _subtract(transition, others))
         return before + daily_from
+
+    async def _async_get_month_remainders(
+        self, house: str, reads: list[DailyUsageRead]
+    ) -> dict[tuple[int, int], DailyUsageRead]:
+        """What each past month's daily reads lack to reach Life's monthly figure.
+
+        Some days leave out what Life counts in its months: on the tested
+        account, the first days of the contract came at 0 EUR, without the
+        subscription their month counted. Only months the daily reads cover
+        to the end are checked, since the month of the last read can still
+        get days, and only a lack beyond rounding counts.
+        """
+        if not reads:
+            return {}
+        last_month = _month_of(reads[-1])
+        months = {_month_of(r) for r in reads if not r.monthly and _month_of(r) < last_month}
+        if not months:
+            return {}
+        start = min(r.date for r in reads if _month_of(r) in months)
+        monthly_reads = await self.api.async_get_monthly_usage(
+            house, datetime(start.year, start.month, 1), datetime.now()
+        )
+        remainders = {}
+        for monthly in monthly_reads:
+            month = _month_of(monthly)
+            if month not in months:
+                continue
+            remainder = _subtract(monthly, [r for r in reads if _month_of(r) == month])
+            if remainder.amountOfEnergy > MONTH_ROUNDING or remainder.price > MONTH_ROUNDING:
+                _LOGGER.info(
+                    "Reads of %d-%02d lack %.3f kWh and %.2f EUR of Life's monthly figure: "
+                    "adding them to the month's first read",
+                    *month,
+                    remainder.amountOfEnergy,
+                    remainder.price,
+                )
+                remainders[month] = remainder
+        return remainders
 
     async def _with_hourly_reads(
         self, house: str, reads: list[DailyUsageRead], details: HouseDetails
