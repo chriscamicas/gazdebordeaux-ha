@@ -4,7 +4,7 @@ import dataclasses
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 from homeassistant.components.recorder.models import (
@@ -43,6 +43,22 @@ from .const import (
 from .gazdebordeaux import DailyUsageRead, Gazdebordeaux, TotalUsageRead, paris_tz
 
 _LOGGER = logging.getLogger(__name__)
+
+# Offset of Paris mean time, which pytz's replace() picks: statistics stored
+# before 1.3.0 are dated with it, at hh:51 in Paris time
+_LMT_OFFSET = cast(timedelta, datetime(2000, 1, 1).replace(tzinfo=paris_tz).utcoffset())
+
+
+def _is_whole_hour(ts: float) -> bool:
+    return datetime.fromtimestamp(ts, paris_tz).minute == 0
+
+
+def _whole_hour_start(ts: float) -> datetime:
+    """The start of a point on the whole Paris hour, if it is dated in Paris mean time."""
+    if _is_whole_hour(ts):
+        return datetime.fromtimestamp(ts, paris_tz)
+    wall_clock = datetime.fromtimestamp(ts, UTC).replace(tzinfo=None) + _LMT_OFFSET
+    return paris_tz.localize(wall_clock)
 
 
 def _has_usage(usage_reads: list[DailyUsageRead]) -> bool:
@@ -246,6 +262,11 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
         # Newest first.
         last_rows = last_stats.get(anchor_statistic_id, [])
 
+        if last_rows and not _is_whole_hour(float(last_rows[0]["start"])):
+            # The next update goes on from the moved points
+            await self._move_to_whole_hours(specs)
+            return
+
         if last_rows and _is_monthly_series(last_rows):
             all_reads = await self._async_get_all_data(house)
             if not _has_usage(all_reads):
@@ -381,7 +402,7 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
             last_stat_date = datetime.fromtimestamp(last_stat_ts, paris_tz)
             last_month = datetime(last_stat_date.year, last_stat_date.month, 1)
             start = (last_month - timedelta(days=1)).replace(day=1)
-            sums = await self._async_get_sums_before(statistic_ids, start.replace(tzinfo=paris_tz))
+            sums = await self._async_get_sums_before(statistic_ids, paris_tz.localize(start))
         _LOGGER.debug("No daily data, importing monthly data since %s", start.strftime("%Y-%m"))
 
         usage_reads = await self.api.async_get_monthly_usage(house, start, now)
@@ -408,6 +429,38 @@ class GdbCoordinator(DataUpdateCoordinator[dict[str, TotalUsageRead]]):
                     StatisticData(start=usage_read.date, state=value, sum=sums[spec.statistic_id])
                 )
         self._add_statistics(specs, statistics)
+
+    async def _move_to_whole_hours(self, specs: tuple[StatisticSpec, ...]) -> None:
+        """Move the points dated in Paris mean time (before 1.3.0) to whole hours.
+
+        Only their start changes. Importing them again from Life instead would
+        lose the days before the ones it returns.
+        """
+        stats = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            datetime(2000, 1, 1, tzinfo=UTC),
+            None,
+            {spec.statistic_id for spec in specs},
+            "hour",
+            None,
+            {"state", "sum"},
+        )
+        moved = {
+            statistic_id: [
+                StatisticData(
+                    start=_whole_hour_start(row["start"]),
+                    state=float(row["state"] or 0),
+                    sum=float(row["sum"] or 0),
+                )
+                for row in rows
+            ]
+            for statistic_id, rows in stats.items()
+        }
+        _LOGGER.info("Moving %s to whole hours", ", ".join(sorted(moved)))
+        # The recorder runs the clear before the imports queued after it
+        get_instance(self.hass).async_clear_statistics(sorted(moved))
+        self._add_statistics(tuple(spec for spec in specs if spec.statistic_id in moved), moved)
 
     async def _async_get_sums_before(
         self, statistic_ids: set[str], before: datetime

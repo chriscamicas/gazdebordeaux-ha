@@ -217,3 +217,5 @@ async def test_daily_usage_parses_electricity_payload(http_mock, session):
         (29, 15, 3.4, 0),
         (30, 0, 0, 0),
     ]
+    # Midnight Paris time, not Paris mean time (+00:09)
+    assert reads[0].date.isoformat() == "2026-09-29T00:00:00+02:00"

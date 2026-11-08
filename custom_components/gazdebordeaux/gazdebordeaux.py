@@ -190,7 +190,9 @@ class Gazdebordeaux:
             # volumeOfEnergy/ratio at 0, and days without data may omit keys.
             usage_reads.append(
                 DailyUsageRead(
-                    date=datetime.strptime(d, date_format).replace(tzinfo=paris_tz),
+                    # localize(), not replace(): pytz's replace() picks Paris
+                    # mean time (+00:09) and puts every day at 23:51 UTC
+                    date=paris_tz.localize(datetime.strptime(d, date_format)),
                     amountOfEnergy=daily_data[d]["kwh"],
                     volumeOfEnergy=daily_data[d].get("volumeOfEnergy", 0),
                     price=daily_data[d]["price"],

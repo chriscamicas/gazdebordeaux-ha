@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0]
+- Date the daily and monthly reads at midnight Paris time instead of Paris mean time, which put every point at hh:51; existing statistics are moved to the whole hour once, in place, so no history is lost
+
 ## [1.2.0] - 2026-11-07
 - Add electricity consumption tracking: an electricity contract is imported into the `gazdebordeaux:electricity_consumption` and `gazdebordeaux:electricity_cost` statistics (Energy dashboard → Electricity grid consumption), with matching sensors on a new "Gaz de Bordeaux Électricité" device
 - Fall back to monthly statistics (one point per month, on the 1st) for contracts whose daily data is always 0, as observed on some electricity contracts; the last two months are rewritten on each refresh so the current month stays up to date

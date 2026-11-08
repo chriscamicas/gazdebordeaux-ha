@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
@@ -23,10 +24,11 @@ from custom_components.gazdebordeaux.const import (
     DOMAIN,
     NONE,
 )
-from custom_components.gazdebordeaux.coordinator import GdbCoordinator
+from custom_components.gazdebordeaux.coordinator import ENERGY_STATISTICS, GdbCoordinator
 from custom_components.gazdebordeaux.gazdebordeaux import DailyUsageRead
 
 ELEC = "/api/houses/elec-uuid"
+GAS = "/api/houses/gas-uuid"
 PARIS = pytz.timezone("Europe/Paris")
 
 
@@ -96,7 +98,7 @@ async def test_electricity_statistics_are_imported_incrementally(hass: HomeAssis
 def _month(year: int, month: int, kwh: float, price: float) -> DailyUsageRead:
     # Same tz handling as the API client's parser.
     return DailyUsageRead(
-        date=datetime(year, month, 1).replace(tzinfo=PARIS),
+        date=PARIS.localize(datetime(year, month, 1)),
         amountOfEnergy=kwh,
         volumeOfEnergy=0,
         price=price,
@@ -217,7 +219,7 @@ async def test_zero_recent_days_do_not_switch_gas_to_monthly(hass: HomeAssistant
 def _day(month: int, day: int, kwh: float, price: float) -> DailyUsageRead:
     # Same tz handling as the API client's parser, so days and months line up.
     return DailyUsageRead(
-        date=datetime(2026, month, day).replace(tzinfo=PARIS),
+        date=PARIS.localize(datetime(2026, month, day)),
         amountOfEnergy=kwh,
         volumeOfEnergy=0,
         price=price,
@@ -271,11 +273,13 @@ EXPECTED_HYBRID = [
 EXPECTED_HYBRID_COST = [112.6, 214.3, 222.8, 222.8, 224.8, 227.3, 229.4]
 
 
-async def _hourly_rows(hass: HomeAssistant, statistic_id: str) -> list:
+async def _hourly_rows(
+    hass: HomeAssistant, statistic_id: str, since: datetime = datetime(2026, 7, 1)
+) -> list:
     stats = await hass.async_add_executor_job(
         statistics_during_period,
         hass,
-        datetime(2026, 7, 1).replace(tzinfo=PARIS),
+        since.replace(tzinfo=PARIS),
         None,
         {statistic_id},
         "hour",
@@ -335,3 +339,95 @@ async def test_monthly_series_is_rebuilt_when_daily_data_appears(hass: HomeAssis
 
     consumption = await _hourly_rows(hass, f"{DOMAIN}:electricity_consumption")
     assert [round(r["sum"], 3) for r in consumption][-2:] == [1151.5, 1160.0]
+
+
+def _gas_entry(hass: HomeAssistant) -> MockConfigEntry:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        data={
+            CONF_USERNAME: "user@example.com",
+            CONF_PASSWORD: "secret",
+            CONF_GAS_HOUSE: GAS,
+            CONF_ELECTRICITY_HOUSE: NONE,
+        },
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+def _paris_mean_time(read: DailyUsageRead) -> DailyUsageRead:
+    """`read` dated like the parser did before 1.3.0, with pytz's replace()."""
+    return dataclasses.replace(read, date=read.date.replace(tzinfo=None).replace(tzinfo=PARIS))
+
+
+def _store(coordinator: GdbCoordinator, energy: str, reads: list[DailyUsageRead]) -> None:
+    specs = ENERGY_STATISTICS[energy]
+    coordinator._import_reads(specs, reads, {spec.statistic_id: 0.0 for spec in specs})
+
+
+async def test_paris_mean_time_points_move_to_whole_hours(hass: HomeAssistant) -> None:
+    """Points stored before 1.3.0 start at hh:51: they move in place."""
+    coordinator = GdbCoordinator(hass, _gas_entry(hass))
+    _store(
+        coordinator,
+        "gas",
+        [_paris_mean_time(_read(1, 10, 2.0)), _paris_mean_time(_read(2, 5, 1.0))],
+    )
+    await async_wait_recording_done(hass)
+
+    daily = AsyncMock(return_value=[_read(2, 5, 1.0), _read(3, 7, 1.5)])
+    with patch.object(coordinator.api, "async_get_daily_usage", new=daily):
+        await coordinator._insert_statistics("gas", GAS)
+        await async_wait_recording_done(hass)
+        moved = await _hourly_rows(hass, f"{DOMAIN}:energy_consumption")
+        # The next update goes on from the moved points
+        await coordinator._insert_statistics("gas", GAS)
+        await async_wait_recording_done(hass)
+
+    assert [datetime.fromtimestamp(r["start"], PARIS).isoformat() for r in moved] == [
+        "2026-09-01T00:00:00+02:00",
+        "2026-09-02T00:00:00+02:00",
+    ]
+    assert [(r["state"], r["sum"]) for r in moved] == [(10, 10), (5, 15)]
+    consumption = await _hourly_rows(hass, f"{DOMAIN}:energy_consumption")
+    assert [(r["state"], r["sum"]) for r in consumption] == [(10, 10), (5, 15), (7, 22)]
+    cost = await _hourly_rows(hass, f"{DOMAIN}:energy_cost")
+    assert [r["sum"] for r in cost] == [2.0, 3.0, 4.5]
+    assert daily.await_count == 1
+
+
+async def test_paris_mean_time_monthly_series_moves_and_stays_monthly(
+    hass: HomeAssistant,
+) -> None:
+    coordinator = GdbCoordinator(hass, _electricity_entry(hass))
+    months = [_month(2026, 4, 39, 8.0), _month(2026, 5, 620, 120.0), _month(2026, 6, 700, 140.0)]
+    _store(coordinator, "electricity", [_paris_mean_time(m) for m in months])
+    await async_wait_recording_done(hass)
+
+    daily = AsyncMock(return_value=[_read(1, 0, 0), _read(2, 0, 0)])
+    monthly = AsyncMock(
+        return_value=[
+            _month(2026, 5, 620, 120.0),
+            _month(2026, 6, 749, 142.0),
+            _month(2026, 7, 829, 155.0),
+        ]
+    )
+    with (
+        patch.object(coordinator.api, "async_get_daily_usage", new=daily),
+        patch.object(coordinator.api, "async_get_monthly_usage", new=monthly),
+    ):
+        await coordinator._insert_statistics("electricity", ELEC)
+        await async_wait_recording_done(hass)
+        await coordinator._insert_statistics("electricity", ELEC)
+        await async_wait_recording_done(hass)
+
+    rows = await _hourly_rows(hass, f"{DOMAIN}:electricity_consumption", datetime(2026, 3, 1))
+    assert [datetime.fromtimestamp(r["start"], PARIS).day for r in rows] == [1, 1, 1, 1]
+    # Rewritten from May on top of April's moved point, without a second May
+    assert [(r["state"], r["sum"]) for r in rows] == [
+        (39, 39),
+        (620, 659),
+        (749, 1408),
+        (829, 2237),
+    ]

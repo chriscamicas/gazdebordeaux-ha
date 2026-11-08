@@ -48,7 +48,7 @@ Electricity `/consumptions` responses have the same shape as gas (`kwh`, `price`
 
 A contract can switch to daily data later, once the customer turns on daily reporting on the website. Daily history then starts on that day; it isn't backfilled. Observed in November 2026: zero every day through 4 Oct, real days from 5 Oct, and 1–4 Oct only present in October's `scale=year` figure. `_insert_full_history` handles that by importing monthly points for the months before the first day with data. It then adds a point on the 1st of that month holding the monthly figure minus the month's daily reads, followed by the daily reads, so totals match the website's. When an existing series is monthly (`_is_monthly_series`: the two newest points are a month apart, on the 1st) and daily data shows up, the series is cleared and rebuilt with `_insert_full_history`.
 
-Note that `DailyUsageRead.date` uses `.replace(tzinfo=paris_tz)` (pytz LMT, +00:09). Existing gas statistics are stored with that offset, so don't "fix" it to `localize()` without migrating them.
+`DailyUsageRead.date` uses `paris_tz.localize()`. pytz's `.replace(tzinfo=paris_tz)` picks Paris mean time (LMT, +00:09) and puts each point at hh:51 in Paris time, which is how statistics were stored before 1.3.0. When the newest point of a series is off the hour, `_move_to_whole_hours` moves every point of that energy's series to the whole hour, in place (same states and sums). Importing them again from Life instead would lose the days before the first import's range. `_is_first_of_month` accepts both offsets.
 
 ### Config entry shape (version 2)
 
